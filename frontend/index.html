@@ -59,7 +59,7 @@
                         <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg>
                     </span>
                     <span>Notifications</span>
-                    <span id="notif-badge" class="notif-badge" style="display: none;">0</span>
+                    <span id="notif-badge" class="notif-badge hidden">0</span>
                 </button>
                 <button id="contacts-btn" class="sidebar-footer-btn" data-tip="Contacts">
                     <span class="contacts-icon" aria-hidden="true">
@@ -185,23 +185,23 @@
                         <h2 class="welcome-headline">Hi, I'm <strong>Athen</strong>.</h2>
                         <p class="welcome-sub">Pick a quick start, or just type below.</p>
                         <div class="welcome-chips">
-                            <button type="button" class="welcome-chip" data-welcome-prompt="Triage my inbox and summarize what needs my attention." style="animation-delay:160ms">
-                                <span class="welcome-chip-icon" aria-hidden="true">📥</span>
+                            <button type="button" class="welcome-chip" data-welcome-prompt="Triage my inbox and summarize what needs my attention.">
+                                <span class="welcome-chip-icon" aria-hidden="true"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg></span>
                                 <span class="welcome-chip-label">Triage my inbox</span>
                                 <span class="welcome-chip-arrow" aria-hidden="true">→</span>
                             </button>
-                            <button type="button" class="welcome-chip" data-welcome-prompt="What's on my calendar today, and what should I focus on?" style="animation-delay:220ms">
-                                <span class="welcome-chip-icon" aria-hidden="true">📅</span>
+                            <button type="button" class="welcome-chip" data-welcome-prompt="What's on my calendar today, and what should I focus on?">
+                                <span class="welcome-chip-icon" aria-hidden="true"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg></span>
                                 <span class="welcome-chip-label">Plan my day</span>
                                 <span class="welcome-chip-arrow" aria-hidden="true">→</span>
                             </button>
-                            <button type="button" class="welcome-chip" data-welcome-prompt="Help me draft a message: " style="animation-delay:280ms">
-                                <span class="welcome-chip-icon" aria-hidden="true">✍️</span>
+                            <button type="button" class="welcome-chip" data-welcome-prompt="Help me draft a message: ">
+                                <span class="welcome-chip-icon" aria-hidden="true"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg></span>
                                 <span class="welcome-chip-label">Draft a message</span>
                                 <span class="welcome-chip-arrow" aria-hidden="true">→</span>
                             </button>
-                            <button type="button" class="welcome-chip" data-welcome-prompt="Research this topic for me: " style="animation-delay:340ms">
-                                <span class="welcome-chip-icon" aria-hidden="true">🔎</span>
+                            <button type="button" class="welcome-chip" data-welcome-prompt="Research this topic for me: ">
+                                <span class="welcome-chip-icon" aria-hidden="true"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg></span>
                                 <span class="welcome-chip-label">Research a topic</span>
                                 <span class="welcome-chip-arrow" aria-hidden="true">→</span>
                             </button>
@@ -243,7 +243,7 @@
                                 </button>
                             </div>
                         </div>
-                        <textarea id="message-input" placeholder="Send a message..." rows="1" autofocus></textarea>
+                        <textarea id="message-input" placeholder="Send a message…" rows="1" autofocus></textarea>
                         <button type="submit" id="send-btn" data-tip="Send message" aria-label="Send message">
                             <span class="send-icon" aria-hidden="true">
                                 <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg>
@@ -305,7 +305,7 @@
                         <span>&#8592;</span> Back
                     </button>
                 </div>
-                <h1>Arc Timeline</h1>
+                <h2>Arc Timeline</h2>
                 <button id="timeline-new-arc" class="timeline-new-btn" data-tip="New Arc">+ New Arc</button>
             </header>
             <div id="timeline-canvas" class="timeline-canvas"></div>
@@ -318,20 +318,20 @@
                     <span>&#8592;</span> Back
                 </button>
             </div>
-            <h1>Settings</h1>
+            <h2>Settings</h2>
         </header>
 
         <div class="settings-content">
             <nav class="settings-tabs" role="tablist">
-                <button class="settings-tab active" data-settings-tab="models" role="tab" aria-selected="true">Models</button>
-                <button class="settings-tab" data-settings-tab="agents" role="tab" aria-selected="false">Agents &amp; Tools</button>
-                <button class="settings-tab" data-settings-tab="projects" role="tab" aria-selected="false">Projects</button>
-                <button class="settings-tab" data-settings-tab="connections" role="tab" aria-selected="false">Connections</button>
-                <button class="settings-tab" data-settings-tab="remote-access" role="tab" aria-selected="false">Remote Access</button>
-                <button class="settings-tab" data-settings-tab="security" role="tab" aria-selected="false">Security &amp; Access</button>
+                <button class="settings-tab active" id="settings-tab-models" data-settings-tab="models" role="tab" aria-selected="true">Models</button>
+                <button class="settings-tab" id="settings-tab-agents" data-settings-tab="agents" role="tab" aria-selected="false">Agents &amp; Tools</button>
+                <button class="settings-tab" id="settings-tab-projects" data-settings-tab="projects" role="tab" aria-selected="false">Projects</button>
+                <button class="settings-tab" id="settings-tab-connections" data-settings-tab="connections" role="tab" aria-selected="false">Connections</button>
+                <button class="settings-tab" id="settings-tab-remote-access" data-settings-tab="remote-access" role="tab" aria-selected="false">Remote Access</button>
+                <button class="settings-tab" id="settings-tab-security" data-settings-tab="security" role="tab" aria-selected="false">Security &amp; Access</button>
             </nav>
 
-            <div class="settings-tab-pane active" data-settings-pane="models">
+            <div class="settings-tab-pane active" data-settings-pane="models" role="tabpanel" aria-labelledby="settings-tab-models">
             <section class="settings-section">
                 <h2>Bundles</h2>
                 <p class="settings-description">A Bundle picks which Connection &amp; model to use for each tier. <strong>Judges</strong> runs the high-volume, parallel auxiliary calls (risk triage, completion judges, classifiers, fact extraction) — put a cheap, fast model here, ideally an external API. <strong>Fast</strong> runs the actual task work (the agent doing your request) — point it at your main / local model. <strong>Code</strong> and <strong>Powerful</strong> are optional upgrades for coding and hard tasks (both fall back to Fast). Switch Bundles to swap your whole loadout at once.</p>
@@ -361,7 +361,7 @@
                 <p class="settings-description">Configure how Athen processes and remembers information.</p>
 
                 <div class="setting-row">
-                    <label for="embedding-mode">Memory Quality</label>
+                    <label for="embedding-mode">Memory quality</label>
                     <select id="embedding-mode" class="settings-select">
                         <option value="Automatic">Automatic (recommended)</option>
                         <option value="Bundled">Built-in (multilingual)</option>
@@ -372,7 +372,7 @@
                     <p class="setting-hint" id="embedding-mode-hint">Auto-detects the best available provider for generating embeddings.</p>
                 </div>
 
-                <div id="bundled-emb-panel" class="bundled-emb-panel" style="display: none;">
+                <div id="bundled-emb-panel" class="bundled-emb-panel hidden">
                     <div class="bundled-emb-header">
                         <h3>Built-in multilingual embeddings</h3>
                         <p class="bundled-emb-blurb">Runs locally on your machine, no API key needed. Supports 95+ languages.</p>
@@ -402,7 +402,7 @@
                     </label>
                 </div>
 
-                <div id="embedding-advanced" style="display: none;">
+                <div id="embedding-advanced" class="hidden">
                     <div class="setting-row">
                         <label for="embedding-provider">Provider</label>
                         <select id="embedding-provider" class="settings-select">
@@ -425,32 +425,32 @@
                     </div>
 
                     <div class="setting-row">
-                        <label for="embedding-api-key">API Key</label>
+                        <label for="embedding-api-key">API key</label>
                         <div class="api-key-wrapper">
                             <input type="password" id="embedding-api-key" class="settings-input" placeholder="Only needed for cloud providers" autocomplete="off">
-                            <button class="api-key-toggle" id="embedding-key-toggle" data-tip="Show/hide key" aria-label="Show/hide key">&#128065;</button>
+                            <button class="api-key-toggle" id="embedding-key-toggle" data-tip="Show/hide key" aria-label="Show/hide key"><svg class="icon-eye" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg><svg class="icon-eye-off" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg></button>
                         </div>
                     </div>
 
                     <div class="setting-actions">
-                        <button id="test-embedding-btn" class="btn-secondary">Test Connection</button>
+                        <button id="test-embedding-btn" class="btn-secondary">Test connection</button>
                     </div>
                     <div id="embedding-test-result" class="test-result hidden"></div>
                 </div>
 
                 <div class="setting-actions">
-                    <button id="save-embedding-btn" class="btn-primary">Save Embedding Settings</button>
+                    <button id="save-embedding-btn" class="btn-primary">Save embedding settings</button>
                 </div>
             </section>
             </div>
 
-            <div class="settings-tab-pane" data-settings-pane="agents">
+            <div class="settings-tab-pane" data-settings-pane="agents" role="tabpanel" aria-labelledby="settings-tab-agents">
             <section class="settings-section">
                 <h2>Agent Profiles</h2>
                 <p class="settings-description">Specialists that handle different kinds of work. Built-ins ship with Athen and can be cloned to customize. Your own profiles can be edited or deleted freely.</p>
                 <div id="profile-list" class="profile-list"></div>
                 <div class="setting-actions">
-                    <button id="new-profile-btn" class="btn-primary">+ New Profile</button>
+                    <button id="new-profile-btn" class="btn-primary">+ New profile</button>
                 </div>
             </section>
 
@@ -502,10 +502,10 @@
                     Connect tools from Slack, Notion, GitHub, and more by adding a Model Context Protocol server. Each one runs as a sandboxed subprocess on your machine. <a href="https://modelcontextprotocol.io/" target="_blank" rel="noopener">Where do MCP servers come from?</a>
                 </p>
                 <div id="mcp-servers-list" class="mcp-servers-list">
-                    <p class="setting-hint">No MCP servers yet. Click <strong>+ Add Server</strong> below to wire up <code>npx</code>, <code>uvx</code>, or any local stdio MCP binary.</p>
+                    <p class="setting-hint">No MCP servers yet. Click <strong>+ Add server</strong> below to wire up <code>npx</code>, <code>uvx</code>, or any local stdio MCP binary.</p>
                 </div>
                 <div class="setting-actions">
-                    <button id="mcp-servers-add-btn" class="btn-primary" type="button">+ Add Server</button>
+                    <button id="mcp-servers-add-btn" class="btn-primary" type="button">+ Add server</button>
                 </div>
             </section>
 
@@ -519,7 +519,7 @@
             </section>
             </div>
 
-            <div class="settings-tab-pane" data-settings-pane="projects">
+            <div class="settings-tab-pane" data-settings-pane="projects" role="tabpanel" aria-labelledby="settings-tab-projects">
             <section class="settings-section">
                 <h2>Projects</h2>
                 <p class="settings-description">Projects group many arcs around a shared body of work, like a ChatGPT/Claude project. Each project has a workspace folder, optional standing instructions injected into every arc inside it, and a maintained summary of work done so far. Assign an arc to a project from its <strong>⋯</strong> menu in the sidebar.</p>
@@ -542,7 +542,7 @@
             </section>
             </div>
 
-            <div class="settings-tab-pane" data-settings-pane="remote-access">
+            <div class="settings-tab-pane" data-settings-pane="remote-access" role="tabpanel" aria-labelledby="settings-tab-remote-access">
             <section class="settings-section">
                 <h2>Remote Access</h2>
                 <p class="settings-description">Run Athen's web UI as a small password-protected server so you can reach it from your phone or another machine. The same agent — with its shell, file, and tool access — answers on that link. Keep this <strong>off</strong> unless you need it: anyone with the link <em>and</em> the credentials controls a shell-capable agent on this computer.</p>
@@ -591,7 +591,7 @@
             </section>
             </div>
 
-            <div class="settings-tab-pane" data-settings-pane="connections">
+            <div class="settings-tab-pane" data-settings-pane="connections" role="tabpanel" aria-labelledby="settings-tab-connections">
             <section class="settings-section" id="owner-contact-section">
                 <h2>My Contact Info</h2>
                 <p class="settings-description">
@@ -609,13 +609,13 @@
                     <button class="btn-primary" id="save-owner-contact-btn">Save</button>
                     <button class="btn-secondary" id="clear-owner-contact-btn">Remove</button>
                 </div>
-                <div id="owner-contact-error" class="setting-hint" style="display:none; color: var(--danger);"></div>
+                <div id="owner-contact-error" class="setting-hint setting-hint-danger hidden"></div>
             </section>
 
             <section class="settings-section">
                 <div class="email-section-heading">
                     <h2>Email Monitor</h2>
-                    <span id="email-connected-pill" class="email-status-pill" style="display:none;"></span>
+                    <span id="email-connected-pill" class="email-status-pill hidden"></span>
                 </div>
                 <p class="settings-description">Connect your email to let Athen monitor and act on incoming messages.</p>
 
@@ -632,36 +632,36 @@
                         <input type="text" id="email-username" class="settings-input" placeholder="you@gmail.com" autocomplete="email">
                     </div>
 
-                    <div id="email-provider-hint" class="email-provider-hint" style="display:none;"></div>
+                    <div id="email-provider-hint" class="email-provider-hint hidden"></div>
 
                     <div class="setting-row">
-                        <label for="email-password">Password / App Password</label>
+                        <label for="email-password">Password / app password</label>
                         <input type="password" id="email-password" class="settings-input" placeholder="Enter app password">
                         <p class="setting-hint" id="email-password-hint">Most providers need an app-specific password, not your regular login password.</p>
                     </div>
 
                     <div class="setting-row">
-                        <label for="email-smtp-password">SMTP Password</label>
+                        <label for="email-smtp-password">SMTP password</label>
                         <div class="api-key-wrapper">
                             <input type="password" id="email-smtp-password" class="settings-input" placeholder="App password (same as above on most providers)" autocomplete="off">
-                            <button class="api-key-toggle" id="email-smtp-password-toggle" data-tip="Show/hide password" type="button" aria-label="Show/hide password">&#128065;</button>
+                            <button class="api-key-toggle" id="email-smtp-password-toggle" data-tip="Show/hide password" type="button" aria-label="Show/hide password"><svg class="icon-eye" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg><svg class="icon-eye-off" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg></button>
                         </div>
                         <p class="setting-hint">Same app password works for both IMAP and SMTP on most providers.</p>
                     </div>
 
                     <div class="setting-row">
-                        <label for="email-from-address">From Address</label>
+                        <label for="email-from-address">From address</label>
                         <input type="text" id="email-from-address" class="settings-input" placeholder="Alex &lt;alex@example.com&gt;">
                         <p class="setting-hint">What recipients see. Plain "alex@example.com" or "Alex &lt;alex@example.com&gt;" both work.</p>
                     </div>
 
                     <div class="setting-row">
-                        <label for="email-folders">Folders to Monitor</label>
+                        <label for="email-folders">Folders to monitor</label>
                         <input type="text" id="email-folders" class="settings-input" value="INBOX" placeholder="INBOX, Important">
                         <p class="setting-hint">Comma-separated list of IMAP folders.</p>
                     </div>
                     <div class="setting-row">
-                        <label for="email-poll-interval">Poll Interval (seconds)</label>
+                        <label for="email-poll-interval">Poll interval (seconds)</label>
                         <input type="number" id="email-poll-interval" class="settings-input" value="60" min="10" max="3600">
                     </div>
                     <div class="setting-row">
@@ -675,7 +675,7 @@
                         <div class="email-advanced-body">
                             <h4 class="settings-subhead settings-subhead-tight">Incoming (IMAP)</h4>
                             <div class="setting-row">
-                                <label for="email-imap-server">IMAP Server</label>
+                                <label for="email-imap-server">IMAP server</label>
                                 <input type="text" id="email-imap-server" class="settings-input" placeholder="imap.gmail.com">
                             </div>
                             <div class="setting-row">
@@ -691,7 +691,7 @@
 
                             <h4 class="settings-subhead settings-subhead-tight">Outgoing (SMTP)</h4>
                             <div class="setting-row">
-                                <label for="email-smtp-server">SMTP Server</label>
+                                <label for="email-smtp-server">SMTP server</label>
                                 <input type="text" id="email-smtp-server" class="settings-input" placeholder="smtp.gmail.com">
                             </div>
                             <div class="setting-row">
@@ -700,7 +700,7 @@
                                 <p class="setting-hint">587 for STARTTLS (default), 465 for implicit TLS.</p>
                             </div>
                             <div class="setting-row">
-                                <label for="email-smtp-username">SMTP Username</label>
+                                <label for="email-smtp-username">SMTP username</label>
                                 <input type="text" id="email-smtp-username" class="settings-input" placeholder="you@gmail.com">
                                 <p class="setting-hint">Usually the same as your email address.</p>
                             </div>
@@ -716,7 +716,7 @@
                 </div>
 
                 <div class="setting-actions email-actions">
-                    <button id="test-and-save-btn" class="btn-primary">Test &amp; Save</button>
+                    <button id="test-and-save-btn" class="btn-primary">Test &amp; save</button>
                     <button id="test-email-btn" class="btn-secondary">Test IMAP</button>
                     <button id="save-email-btn" class="btn-secondary">Save IMAP</button>
                     <button id="test-smtp-btn" class="btn-secondary">Test SMTP</button>
@@ -740,27 +740,27 @@
 
                 <div id="telegram-settings-fields">
                     <div class="setting-row">
-                        <label for="telegram-bot-token">Bot Token</label>
+                        <label for="telegram-bot-token">Bot token</label>
                         <div class="api-key-wrapper">
-                            <input type="password" id="telegram-bot-token" class="settings-input" placeholder="123456:ABC-DEF..." autocomplete="off">
-                            <button class="api-key-toggle" id="telegram-token-toggle" data-tip="Show/hide token" aria-label="Show/hide token">&#128065;</button>
+                            <input type="password" id="telegram-bot-token" class="settings-input" placeholder="123456:ABC-DEF…" autocomplete="off">
+                            <button class="api-key-toggle" id="telegram-token-toggle" data-tip="Show/hide token" aria-label="Show/hide token"><svg class="icon-eye" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg><svg class="icon-eye-off" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg></button>
                         </div>
                         <p class="setting-hint" id="telegram-token-hint"></p>
                     </div>
                     <div class="setting-row">
-                        <label for="telegram-chat-ids">Allowed Chat IDs</label>
+                        <label for="telegram-chat-ids">Allowed chat IDs</label>
                         <input type="text" id="telegram-chat-ids" class="settings-input" placeholder="Comma-separated, empty = all">
                         <p class="setting-hint">Only process messages from these chats. Leave empty to accept all.</p>
                     </div>
                     <div class="setting-row">
-                        <label for="telegram-poll-interval">Poll Interval (seconds)</label>
+                        <label for="telegram-poll-interval">Poll interval (seconds)</label>
                         <input type="number" id="telegram-poll-interval" class="settings-input" value="5" min="1" max="300">
                     </div>
                 </div>
 
                 <div class="setting-actions">
-                    <button id="test-telegram-btn" class="btn-secondary">Test Connection</button>
-                    <button id="save-telegram-btn" class="btn-primary">Save Telegram Settings</button>
+                    <button id="test-telegram-btn" class="btn-secondary">Test connection</button>
+                    <button id="save-telegram-btn" class="btn-primary">Save Telegram settings</button>
                 </div>
                 <div id="telegram-test-result" class="test-result hidden"></div>
             </section>
@@ -783,10 +783,10 @@
                     <h3 class="settings-subhead">Bot identity (default for code-flavoured profiles)</h3>
                 </div>
                 <div class="setting-row">
-                    <label for="gh-bot-token">Personal Access Token</label>
+                    <label for="gh-bot-token">Personal access token</label>
                     <div class="api-key-wrapper">
-                        <input type="password" id="gh-bot-token" class="settings-input" placeholder="github_pat_..." autocomplete="off">
-                        <button class="api-key-toggle" id="gh-bot-token-toggle" data-tip="Show/hide token" aria-label="Show/hide token">&#128065;</button>
+                        <input type="password" id="gh-bot-token" class="settings-input" placeholder="github_pat_…" autocomplete="off">
+                        <button class="api-key-toggle" id="gh-bot-token-toggle" data-tip="Show/hide token" aria-label="Show/hide token"><svg class="icon-eye" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg><svg class="icon-eye-off" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg></button>
                     </div>
                     <p class="setting-hint" id="gh-bot-token-hint"></p>
                 </div>
@@ -799,19 +799,19 @@
                     <input type="text" id="gh-bot-email" class="settings-input" placeholder="athen-bot@users.noreply.github.com">
                 </div>
                 <div class="setting-actions">
-                    <button id="test-gh-bot-btn" class="btn-secondary">Test Bot Token</button>
-                    <button id="save-gh-bot-btn" class="btn-primary">Save Bot Identity</button>
+                    <button id="test-gh-bot-btn" class="btn-secondary">Test bot token</button>
+                    <button id="save-gh-bot-btn" class="btn-primary">Save bot identity</button>
                 </div>
                 <div id="gh-bot-test-result" class="test-result hidden"></div>
 
-                <div class="setting-row" style="margin-top:1.5rem;">
+                <div class="setting-row setting-row-spaced">
                     <h3 class="settings-subhead">Your identity (for profiles that act as you)</h3>
                 </div>
                 <div class="setting-row">
-                    <label for="gh-user-token">Personal Access Token</label>
+                    <label for="gh-user-token">Personal access token</label>
                     <div class="api-key-wrapper">
-                        <input type="password" id="gh-user-token" class="settings-input" placeholder="github_pat_..." autocomplete="off">
-                        <button class="api-key-toggle" id="gh-user-token-toggle" data-tip="Show/hide token" aria-label="Show/hide token">&#128065;</button>
+                        <input type="password" id="gh-user-token" class="settings-input" placeholder="github_pat_…" autocomplete="off">
+                        <button class="api-key-toggle" id="gh-user-token-toggle" data-tip="Show/hide token" aria-label="Show/hide token"><svg class="icon-eye" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg><svg class="icon-eye-off" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg></button>
                     </div>
                     <p class="setting-hint" id="gh-user-token-hint"></p>
                 </div>
@@ -824,8 +824,8 @@
                     <input type="text" id="gh-user-email" class="settings-input" placeholder="you@example.com">
                 </div>
                 <div class="setting-actions">
-                    <button id="test-gh-user-btn" class="btn-secondary">Test Your Token</button>
-                    <button id="save-gh-user-btn" class="btn-primary">Save Your Identity</button>
+                    <button id="test-gh-user-btn" class="btn-secondary">Test your token</button>
+                    <button id="save-gh-user-btn" class="btn-primary">Save your identity</button>
                 </div>
                 <div id="gh-user-test-result" class="test-result hidden"></div>
             </section>
@@ -843,10 +843,10 @@
                 </div>
 
                 <div class="setting-actions">
-                    <button id="add-calendar-source-btn" class="btn-primary">Add Calendar Source</button>
+                    <button id="add-calendar-source-btn" class="btn-primary">Add calendar source</button>
                 </div>
 
-                <div id="calendar-source-form" class="calendar-source-form" style="display:none;">
+                <div id="calendar-source-form" class="calendar-source-form hidden">
                     <h3 class="settings-subhead">New Calendar Source</h3>
 
                     <div class="setting-row">
@@ -882,24 +882,24 @@
                         <label for="calendar-source-password">App-specific password</label>
                         <div class="api-key-wrapper">
                             <input type="password" id="calendar-source-password" class="settings-input" placeholder="xxxx-xxxx-xxxx-xxxx" autocomplete="off">
-                            <button class="api-key-toggle" id="calendar-source-password-toggle" data-tip="Show/hide password" type="button" aria-label="Show/hide password">&#128065;</button>
+                            <button class="api-key-toggle" id="calendar-source-password-toggle" data-tip="Show/hide password" type="button" aria-label="Show/hide password"><svg class="icon-eye" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg><svg class="icon-eye-off" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg></button>
                         </div>
                     </div>
 
                     <div class="setting-actions">
                         <button id="cancel-calendar-source-btn" class="btn-secondary">Cancel</button>
-                        <button id="save-calendar-source-btn" class="btn-primary">Add and Test</button>
+                        <button id="save-calendar-source-btn" class="btn-primary">Add and test</button>
                     </div>
                     <div id="calendar-source-form-result" class="test-result hidden"></div>
                 </div>
 
-                <div id="calendar-source-picker" class="calendar-source-form" style="display:none;">
+                <div id="calendar-source-picker" class="calendar-source-form hidden">
                     <h3 class="settings-subhead">Pick calendars to sync</h3>
                     <p class="setting-hint" id="calendar-source-picker-help">Empty selection = sync every calendar this account exposes.</p>
                     <div id="calendar-source-picker-list"></div>
                     <div class="setting-actions">
                         <button id="calendar-source-picker-cancel" class="btn-secondary">Cancel</button>
-                        <button id="calendar-source-picker-save" class="btn-primary">Save Selection</button>
+                        <button id="calendar-source-picker-save" class="btn-primary">Save selection</button>
                     </div>
                 </div>
             </section>
@@ -915,7 +915,7 @@
                     <label for="web-search-brave">Brave Search API key</label>
                     <div class="api-key-wrapper">
                         <input type="password" id="web-search-brave" class="settings-input" placeholder="BSA…" autocomplete="off">
-                        <button class="api-key-toggle" id="web-search-brave-toggle" data-tip="Show/hide key" aria-label="Show/hide key">&#128065;</button>
+                        <button class="api-key-toggle" id="web-search-brave-toggle" data-tip="Show/hide key" aria-label="Show/hide key"><svg class="icon-eye" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg><svg class="icon-eye-off" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg></button>
                     </div>
                     <p class="setting-hint" id="web-search-brave-hint">2,000 free queries/month. Sign up at <a href="https://api.search.brave.com" target="_blank">api.search.brave.com</a>.</p>
                 </div>
@@ -924,7 +924,7 @@
                     <label for="web-search-tavily">Tavily API key</label>
                     <div class="api-key-wrapper">
                         <input type="password" id="web-search-tavily" class="settings-input" placeholder="tvly-…" autocomplete="off">
-                        <button class="api-key-toggle" id="web-search-tavily-toggle" data-tip="Show/hide key" aria-label="Show/hide key">&#128065;</button>
+                        <button class="api-key-toggle" id="web-search-tavily-toggle" data-tip="Show/hide key" aria-label="Show/hide key"><svg class="icon-eye" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg><svg class="icon-eye-off" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg></button>
                     </div>
                     <p class="setting-hint" id="web-search-tavily-hint">~1,000 free queries/month, answer-ready snippets. Sign up at <a href="https://tavily.com" target="_blank">tavily.com</a>.</p>
                 </div>
@@ -932,7 +932,7 @@
                 <div class="setting-actions">
                     <button id="test-web-search-brave-btn" class="btn-secondary">Test Brave</button>
                     <button id="test-web-search-tavily-btn" class="btn-secondary">Test Tavily</button>
-                    <button id="save-web-search-btn" class="btn-primary">Save Web Search Settings</button>
+                    <button id="save-web-search-btn" class="btn-primary">Save web search settings</button>
                 </div>
                 <div id="web-search-test-result" class="test-result hidden"></div>
             </section>
@@ -946,7 +946,7 @@
                     <p class="setting-hint">No endpoints registered yet.</p>
                 </div>
                 <div class="setting-actions">
-                    <button id="cloud-apis-add-btn" class="btn-primary" type="button">+ Add Endpoint</button>
+                    <button id="cloud-apis-add-btn" class="btn-primary" type="button">+ Add endpoint</button>
                 </div>
             </section>
 
@@ -1000,7 +1000,7 @@
                         </div>
                         <div class="voice-row">
                             <label for="voice-ngrok-authtoken">ngrok auth token</label>
-                            <input id="voice-ngrok-authtoken" type="password" class="settings-input" placeholder="2abcDEF..." autocomplete="off" />
+                            <input id="voice-ngrok-authtoken" type="password" class="settings-input" placeholder="2abcDEF…" autocomplete="off" />
                             <p class="setting-hint">Required for calls: Twilio streams call audio back to this machine over a public URL. Get a free token at <a href="https://dashboard.ngrok.com/get-started/your-authtoken">dashboard.ngrok.com</a>. Leave the URL below blank to use ngrok.</p>
                         </div>
                         <div class="voice-row">
@@ -1014,8 +1014,8 @@
                         <summary>Voice runtime setup</summary>
                         <p id="voice-setup-status">Checking…</p>
                         <ul class="voice-setup-checks">
-                            <li id="voice-check-python" class="is-pending">⏳ Portable Python</li>
-                            <li id="voice-check-pipecat" class="is-pending">⏳ Pipecat (audio runtime)</li>
+                            <li id="voice-check-python" class="is-pending"><span class="voice-check-icon" aria-hidden="true"><svg class="voice-check-icon-pending" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M6 2h12M6 22h12M8 2v4l4 4 4-4V2M8 22v-4l4-4 4 4v4"/></svg><svg class="voice-check-icon-ok" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg></span><span class="voice-check-label">Portable Python</span></li>
+                            <li id="voice-check-pipecat" class="is-pending"><span class="voice-check-icon" aria-hidden="true"><svg class="voice-check-icon-pending" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M6 2h12M6 22h12M8 2v4l4 4 4-4V2M8 22v-4l4-4 4 4v4"/></svg><svg class="voice-check-icon-ok" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg></span><span class="voice-check-label">Pipecat (audio runtime)</span></li>
                         </ul>
                         <p class="voice-setup-blurb">One-time download. Pipecat is ~80 MB; portable Python (if missing) is another ~50 MB.</p>
                         <button id="voice-install-btn" type="button">Install runtime</button>
@@ -1048,7 +1048,7 @@
                     <div class="att-mime-bundle-grid">
                         <label class="att-mime-bundle">
                             <input type="checkbox" class="att-mime-bundle-checkbox" data-bundle="images">
-                            <span class="att-mime-bundle-icon" aria-hidden="true">🖼️</span>
+                            <span class="att-mime-bundle-icon" aria-hidden="true"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg></span>
                             <span class="att-mime-bundle-label">
                                 <strong>Images</strong>
                                 <span class="att-mime-bundle-detail">PNG, JPEG, GIF, WebP, …</span>
@@ -1056,7 +1056,7 @@
                         </label>
                         <label class="att-mime-bundle">
                             <input type="checkbox" class="att-mime-bundle-checkbox" data-bundle="pdfs">
-                            <span class="att-mime-bundle-icon" aria-hidden="true">📕</span>
+                            <span class="att-mime-bundle-icon" aria-hidden="true"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg></span>
                             <span class="att-mime-bundle-label">
                                 <strong>PDFs</strong>
                                 <span class="att-mime-bundle-detail">Documents, scans, forms</span>
@@ -1064,7 +1064,7 @@
                         </label>
                         <label class="att-mime-bundle">
                             <input type="checkbox" class="att-mime-bundle-checkbox" data-bundle="text">
-                            <span class="att-mime-bundle-icon" aria-hidden="true">📝</span>
+                            <span class="att-mime-bundle-icon" aria-hidden="true"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg></span>
                             <span class="att-mime-bundle-label">
                                 <strong>Text &amp; code</strong>
                                 <span class="att-mime-bundle-detail">.txt, .md, .csv, source files</span>
@@ -1072,7 +1072,7 @@
                         </label>
                         <label class="att-mime-bundle">
                             <input type="checkbox" class="att-mime-bundle-checkbox" data-bundle="office">
-                            <span class="att-mime-bundle-icon" aria-hidden="true">📊</span>
+                            <span class="att-mime-bundle-icon" aria-hidden="true"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg></span>
                             <span class="att-mime-bundle-label">
                                 <strong>Office documents</strong>
                                 <span class="att-mime-bundle-detail">Word, Excel, PowerPoint</span>
@@ -1080,7 +1080,7 @@
                         </label>
                         <label class="att-mime-bundle">
                             <input type="checkbox" class="att-mime-bundle-checkbox" data-bundle="data">
-                            <span class="att-mime-bundle-icon" aria-hidden="true">🔧</span>
+                            <span class="att-mime-bundle-icon" aria-hidden="true"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg></span>
                             <span class="att-mime-bundle-label">
                                 <strong>Data files</strong>
                                 <span class="att-mime-bundle-detail">JSON, XML</span>
@@ -1133,7 +1133,7 @@
                 </div>
 
                 <div class="setting-actions">
-                    <button id="save-attachment-policy-btn" class="btn-primary">Save Attachment Policy</button>
+                    <button id="save-attachment-policy-btn" class="btn-primary">Save attachment policy</button>
                 </div>
                 <div id="attachment-policy-result" class="test-result hidden"></div>
             </section>
@@ -1143,13 +1143,13 @@
                 <p class="settings-description">Configure how Athen contacts you for important events and approvals.</p>
 
                 <div class="setting-row">
-                    <label>Channel Priority</label>
+                    <label>Channel priority</label>
                     <p class="setting-hint">Order in which channels are tried. First channel is preferred.</p>
                     <div id="notif-channel-order"></div>
                 </div>
 
                 <div class="setting-row">
-                    <label for="notif-escalation-timeout">Escalation Timeout (seconds)</label>
+                    <label for="notif-escalation-timeout">Escalation timeout (seconds)</label>
                     <input type="number" id="notif-escalation-timeout" class="settings-input" value="300" min="60" max="3600">
                     <p class="setting-hint">Wait this long before trying the next channel when no response.</p>
                 </div>
@@ -1161,22 +1161,22 @@
                     </label>
                 </div>
 
-                <div id="quiet-hours-fields" style="display: none;">
+                <div id="quiet-hours-fields" class="hidden">
                     <div class="settings-field-row">
                         <div class="setting-row">
                             <label>Start</label>
                             <div class="time-input">
-                                <input type="number" id="notif-quiet-start-hour" class="settings-input" value="22" min="0" max="23" style="width: 60px">
+                                <input type="number" id="notif-quiet-start-hour" class="settings-input settings-input-time" value="22" min="0" max="23">
                                 <span>:</span>
-                                <input type="number" id="notif-quiet-start-minute" class="settings-input" value="0" min="0" max="59" style="width: 60px">
+                                <input type="number" id="notif-quiet-start-minute" class="settings-input settings-input-time" value="0" min="0" max="59">
                             </div>
                         </div>
                         <div class="setting-row">
                             <label>End</label>
                             <div class="time-input">
-                                <input type="number" id="notif-quiet-end-hour" class="settings-input" value="8" min="0" max="23" style="width: 60px">
+                                <input type="number" id="notif-quiet-end-hour" class="settings-input settings-input-time" value="8" min="0" max="23">
                                 <span>:</span>
-                                <input type="number" id="notif-quiet-end-minute" class="settings-input" value="0" min="0" max="59" style="width: 60px">
+                                <input type="number" id="notif-quiet-end-minute" class="settings-input settings-input-time" value="0" min="0" max="59">
                             </div>
                         </div>
                     </div>
@@ -1189,12 +1189,12 @@
                 </div>
 
                 <div class="setting-actions">
-                    <button id="save-notif-btn" class="btn-primary">Save Notification Settings</button>
+                    <button id="save-notif-btn" class="btn-primary">Save notification settings</button>
                 </div>
             </section>
             </div>
 
-            <div class="settings-tab-pane" data-settings-pane="security">
+            <div class="settings-tab-pane" data-settings-pane="security" role="tabpanel" aria-labelledby="settings-tab-security">
             <section class="settings-section">
                 <h2>Appearance</h2>
                 <div class="setting-row">
@@ -1210,7 +1210,7 @@
             <section class="settings-section">
                 <h2>Security</h2>
                 <div class="setting-row">
-                    <label for="security-mode">Security Mode</label>
+                    <label for="security-mode">Security mode</label>
                     <select id="security-mode" class="settings-select">
                         <option value="assistant">Assistant (recommended)</option>
                         <option value="bunker">Bunker (extra cautious)</option>
@@ -1219,7 +1219,7 @@
                     <p class="setting-hint" id="security-hint">Standard risk evaluation. The agent asks for approval on risky actions.</p>
                 </div>
                 <div class="setting-actions">
-                    <button id="save-security-btn" class="btn-primary">Save Security Settings</button>
+                    <button id="save-security-btn" class="btn-primary">Save security settings</button>
                 </div>
             </section>
 
@@ -1257,8 +1257,8 @@
                         <span>&#8592;</span> Back
                     </button>
                 </div>
-                <h1 id="contacts-title">Contacts</h1>
-                <button class="btn-primary" id="new-contact-btn">+ New Contact</button>
+                <h2 id="contacts-title">Contacts</h2>
+                <button class="btn-primary" id="new-contact-btn">+ New contact</button>
             </header>
             <div class="contacts-content">
                 <!-- LEFT: master list column -->
@@ -1313,7 +1313,7 @@
                 </div>
                 <div class="calendar-nav">
                     <button id="cal-prev" class="cal-nav-btn" data-tip="Previous" aria-label="Previous">&lt;</button>
-                    <h1 id="cal-title">April 2026</h1>
+                    <h2 id="cal-title">April 2026</h2>
                     <button id="cal-next" class="cal-nav-btn" data-tip="Next" aria-label="Next">&gt;</button>
                 </div>
                 <div class="calendar-header-actions">
@@ -1328,12 +1328,12 @@
             </header>
             <div id="cal-prompt-panel" class="cal-prompt-panel hidden">
                 <label for="cal-prompt-textarea">Standing instruction for every calendar reminder</label>
-                <p class="setting-hint">Free text. Sent to the agent along with every calendar event the sense layer fires. Example: <em>"For Trabajo events, draft a 3-line prep summary from related emails. For Familia events, just notify."</em></p>
-                <textarea id="cal-prompt-textarea" rows="5" placeholder="e.g. For Trabajo events, prepare a summary. For Familia, just notify."></textarea>
+                <p class="setting-hint">Free text. Sent to the agent along with every calendar event the sense layer fires. Example: <em>"For Work events, draft a 3-line prep summary from related emails. For Family events, just notify."</em></p>
+                <textarea id="cal-prompt-textarea" rows="5" placeholder="e.g. For Work events, prepare a summary. For Family, just notify."></textarea>
 
-                <label for="cal-agent-default-select" style="margin-top: 12px;">Default calendar for agent-created events</label>
+                <label for="cal-agent-default-select" class="cal-agent-default-label">Default calendar for agent-created events</label>
                 <p class="setting-hint">When the agent creates an event without picking a specific calendar, it lands here. Leave on "Auto-pick" to let Athen choose (only works when one source is configured).</p>
-                <select id="cal-agent-default-select" class="cal-view-select" style="width: 100%;">
+                <select id="cal-agent-default-select" class="cal-view-select cal-view-select-full">
                     <option value="">Auto-pick / Local-only</option>
                 </select>
 
@@ -1344,7 +1344,7 @@
             </div>
             <div id="calendar-grid" class="calendar-grid"></div>
 
-            <div id="cal-modal-overlay" class="cal-modal-overlay hidden">
+            <div id="cal-modal-overlay" class="cal-modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="cal-modal-title">
                 <div class="cal-modal">
                     <div class="cal-modal-header">
                         <h2 id="cal-modal-title">New Event</h2>
@@ -1399,13 +1399,13 @@
                         <div class="cal-field">
                             <label>Color</label>
                             <div class="cal-color-options" id="cal-color-options">
-                                <span class="cal-color-dot selected" data-color="#7aa2f7" style="background:#7aa2f7" data-tip="Blue" aria-label="Blue"></span>
-                                <span class="cal-color-dot" data-color="#bb9af7" style="background:#bb9af7" data-tip="Purple" aria-label="Purple"></span>
-                                <span class="cal-color-dot" data-color="#9ece6a" style="background:#9ece6a" data-tip="Green" aria-label="Green"></span>
-                                <span class="cal-color-dot" data-color="#e0af68" style="background:#e0af68" data-tip="Amber" aria-label="Amber"></span>
-                                <span class="cal-color-dot" data-color="#f7768e" style="background:#f7768e" data-tip="Red" aria-label="Red"></span>
-                                <span class="cal-color-dot" data-color="#73daca" style="background:#73daca" data-tip="Teal" aria-label="Teal"></span>
-                                <span class="cal-color-dot" data-color="#ff9e64" style="background:#ff9e64" data-tip="Orange" aria-label="Orange"></span>
+                                <span class="cal-color-dot selected" data-color="#7aa2f7" data-tip="Blue" aria-label="Blue"></span>
+                                <span class="cal-color-dot" data-color="#bb9af7" data-tip="Purple" aria-label="Purple"></span>
+                                <span class="cal-color-dot" data-color="#9ece6a" data-tip="Green" aria-label="Green"></span>
+                                <span class="cal-color-dot" data-color="#e0af68" data-tip="Amber" aria-label="Amber"></span>
+                                <span class="cal-color-dot" data-color="#f7768e" data-tip="Red" aria-label="Red"></span>
+                                <span class="cal-color-dot" data-color="#73daca" data-tip="Teal" aria-label="Teal"></span>
+                                <span class="cal-color-dot" data-color="#ff9e64" data-tip="Orange" aria-label="Orange"></span>
                             </div>
                         </div>
                         <div class="cal-field">
@@ -1573,19 +1573,19 @@
             </header>
             <div class="agent-control-body">
                 <nav class="agent-control-tabs" role="tablist">
-                    <button class="agent-control-tab active" data-agent-tab="active" role="tab" aria-selected="true" type="button">
+                    <button class="agent-control-tab active" id="agent-tab-active" data-agent-tab="active" role="tab" aria-selected="true" type="button">
                         Active <span id="agent-tab-active-count" class="tab-count hidden">0</span>
                     </button>
-                    <button class="agent-control-tab" data-agent-tab="history" role="tab" aria-selected="false" type="button">
+                    <button class="agent-control-tab" id="agent-tab-history" data-agent-tab="history" role="tab" aria-selected="false" type="button">
                         History
                     </button>
                 </nav>
 
-                <div class="agent-control-tab-pane active" data-agent-pane="active">
+                <div class="agent-control-tab-pane active" data-agent-pane="active" role="tabpanel" aria-labelledby="agent-tab-active">
                     <div id="agent-control-active" class="agent-cards"></div>
                 </div>
 
-                <div class="agent-control-tab-pane" data-agent-pane="history">
+                <div class="agent-control-tab-pane" data-agent-pane="history" role="tabpanel" aria-labelledby="agent-tab-history">
                     <div class="agent-history-toolbar">
                         <div class="agent-filter-chips" role="group" aria-label="Filter by source">
                             <button class="agent-filter-chip active" data-source-filter="all" type="button">All</button>
@@ -1610,20 +1610,20 @@
                 <h2>Memory</h2>
             </header>
 
-            <div class="memory-tabs">
-                <button class="memory-tab active" data-tab="memories">Memories</button>
-                <button class="memory-tab" data-tab="entities">Knowledge Graph</button>
+            <div class="memory-tabs" role="tablist">
+                <button class="memory-tab active" id="memory-tab-memories" data-tab="memories" role="tab" aria-selected="true">Memories</button>
+                <button class="memory-tab" id="memory-tab-entities" data-tab="entities" role="tab" aria-selected="false">Knowledge Graph</button>
             </div>
 
-            <div id="memories-panel" class="memory-panel">
+            <div id="memories-panel" class="memory-panel" role="tabpanel" aria-labelledby="memory-tab-memories">
                 <div class="memory-search">
-                    <input type="text" id="memory-search-input" placeholder="Search memories..." />
+                    <input type="text" id="memory-search-input" placeholder="Search memories…" />
                 </div>
                 <div id="memories-list" class="memories-list">
                 </div>
             </div>
 
-            <div id="entities-panel" class="memory-panel" style="display: none;">
+            <div id="entities-panel" class="memory-panel hidden" role="tabpanel" aria-labelledby="memory-tab-entities">
                 <div id="entities-list" class="entities-list">
                 </div>
             </div>
@@ -1644,14 +1644,14 @@
                 </div>
             </header>
 
-            <div class="memory-tabs project-tabs">
-                <button class="memory-tab project-tab active" data-ptab="overview">Overview</button>
-                <button class="memory-tab project-tab" data-ptab="arcs">Arcs</button>
-                <button class="memory-tab project-tab" data-ptab="files">Files</button>
-                <button class="memory-tab project-tab" data-ptab="memories">Memories</button>
+            <div class="memory-tabs project-tabs" role="tablist">
+                <button class="memory-tab project-tab active" id="project-tab-overview" data-ptab="overview" role="tab" aria-selected="true">Overview</button>
+                <button class="memory-tab project-tab" id="project-tab-arcs" data-ptab="arcs" role="tab" aria-selected="false">Arcs</button>
+                <button class="memory-tab project-tab" id="project-tab-files" data-ptab="files" role="tab" aria-selected="false">Files</button>
+                <button class="memory-tab project-tab" id="project-tab-memories" data-ptab="memories" role="tab" aria-selected="false">Memories</button>
             </div>
 
-            <div id="project-panel-overview" class="memory-panel project-panel">
+            <div id="project-panel-overview" class="memory-panel project-panel" role="tabpanel" aria-labelledby="project-tab-overview">
                 <div class="project-section">
                     <label class="project-field-label" for="project-instructions-input">Instructions</label>
                     <div class="setting-hint">Always-on guidance prepended to every agent working in this project.</div>
@@ -1679,15 +1679,15 @@
                 </div>
             </div>
 
-            <div id="project-panel-arcs" class="memory-panel project-panel" style="display: none;">
+            <div id="project-panel-arcs" class="memory-panel project-panel hidden" role="tabpanel" aria-labelledby="project-tab-arcs">
                 <div id="project-arcs-list" class="project-arcs-list"></div>
             </div>
 
-            <div id="project-panel-files" class="memory-panel project-panel" style="display: none;">
+            <div id="project-panel-files" class="memory-panel project-panel hidden" role="tabpanel" aria-labelledby="project-tab-files">
                 <div id="project-files-list" class="project-files-list"></div>
             </div>
 
-            <div id="project-panel-memories" class="memory-panel project-panel" style="display: none;">
+            <div id="project-panel-memories" class="memory-panel project-panel hidden" role="tabpanel" aria-labelledby="project-tab-memories">
                 <div id="project-memories-list" class="memories-list"></div>
             </div>
         </div>
@@ -1719,7 +1719,7 @@
                 <div class="profile-modal-section">Behavior</div>
                 <div class="cal-field">
                     <label for="profile-persona">Persona instructions</label>
-                    <textarea id="profile-persona" rows="6" class="settings-input" placeholder="How should this agent behave? Voice, mission, constraints..."></textarea>
+                    <textarea id="profile-persona" rows="6" class="settings-input" placeholder="How should this agent behave? Voice, mission, constraints…"></textarea>
                 </div>
                 <div class="profile-modal-section">Routing</div>
                 <div class="cal-field">
@@ -1961,9 +1961,9 @@
          Hidden by default. JS reveals it when invoke('is_first_launch') is true.
          Functional and intentionally bare; visual polish comes with the broader
          UI redesign. -->
-    <div id="onboarding-overlay" class="onboarding-overlay" style="display: none;">
+    <div id="onboarding-overlay" class="onboarding-overlay hidden">
         <div class="onboarding-card">
-            <div id="onb-progress" class="onb-progress" style="display: none;">
+            <div id="onb-progress" class="onb-progress hidden">
                 <span class="onb-progress-step" data-step="pick">1. Brain</span>
                 <span class="onb-progress-step" data-step="memory">2. Memory</span>
                 <span class="onb-progress-step" data-step="search">3. Search</span>
@@ -1973,7 +1973,7 @@
             </div>
 
             <div class="onboarding-step" data-step="welcome">
-                <h1>Welcome to Athen</h1>
+                <h2>Welcome to Athen</h2>
                 <p class="onboarding-hint">
                     Athen is a universal AI agent that lives on your machine. It watches
                     your inbox, calendar and messages, decides what needs doing, and acts —
@@ -1985,13 +1985,13 @@
                 </p>
                 <div class="onboarding-buttons">
                     <button id="onb-skip-1" class="btn-secondary">Skip for now</button>
-                    <button id="onb-manual-btn" class="btn-secondary">Manual Setup</button>
+                    <button id="onb-manual-btn" class="btn-secondary">Manual setup</button>
                     <button id="onb-start-btn" class="btn-primary">Get started</button>
                 </div>
             </div>
 
-            <div class="onboarding-step" data-step="pick" style="display: none;">
-                <h1>Pick your AI brain</h1>
+            <div class="onboarding-step hidden" data-step="pick">
+                <h2>Pick your AI brain</h2>
                 <p class="onboarding-hint">
                     Athen needs a language model to think with. Run one locally for free
                     and total privacy, or paste a cloud key for the strongest models.
@@ -2012,8 +2012,8 @@
                 </div>
             </div>
 
-            <div class="onboarding-step" data-step="local" style="display: none;">
-                <h1>Local model setup</h1>
+            <div class="onboarding-step hidden" data-step="local">
+                <h2>Local model setup</h2>
                 <label>Which server?
                     <!-- Options populated at runtime from list_provider_catalog. -->
                     <select id="onb-local-type"></select>
@@ -2031,14 +2031,14 @@
                 </div>
             </div>
 
-            <div class="onboarding-step" data-step="cloud" style="display: none;">
-                <h1>Cloud provider setup</h1>
+            <div class="onboarding-step hidden" data-step="cloud">
+                <h2>Cloud provider setup</h2>
                 <label>Provider
                     <!-- Options populated at runtime from list_provider_catalog. -->
                     <select id="onb-cloud-type"></select>
                 </label>
                 <label>API key
-                    <input type="password" id="onb-cloud-key" placeholder="sk-...">
+                    <input type="password" id="onb-cloud-key" placeholder="sk-…">
                 </label>
                 <label>Model (optional, leave empty for default)
                     <input type="text" id="onb-cloud-model" placeholder="">
@@ -2050,8 +2050,8 @@
                 </div>
             </div>
 
-            <div class="onboarding-step" data-step="memory" style="display: none;">
-                <h1>How should Athen build memory?</h1>
+            <div class="onboarding-step hidden" data-step="memory">
+                <h2>How should Athen build memory?</h2>
                 <p class="onboarding-hint">
                     Athen indexes everything you tell it so it can recall context across
                     conversations. Pick how those embeddings get computed — you can change
@@ -2072,11 +2072,11 @@
                         <span>Use the keyword fallback. Memory still works but recall is rougher.</span>
                     </button>
                 </div>
-                <div id="onb-mem-config" style="display: none; margin-top: 16px;">
-                    <label id="onb-mem-key-row" style="display: none;">API key
-                        <input type="password" id="onb-mem-key" placeholder="sk-...">
+                <div id="onb-mem-config" class="onb-mem-config hidden">
+                    <label id="onb-mem-key-row" class="hidden">API key
+                        <input type="password" id="onb-mem-key" placeholder="sk-…">
                     </label>
-                    <label id="onb-mem-url-row" style="display: none;">Server URL
+                    <label id="onb-mem-url-row" class="hidden">Server URL
                         <input type="text" id="onb-mem-url" placeholder="http://localhost:11434">
                     </label>
                     <label>Model (optional)
@@ -2092,17 +2092,17 @@
                 </div>
             </div>
 
-            <div class="onboarding-step" data-step="search" style="display: none;">
-                <h1>Web search (recommended)</h1>
+            <div class="onboarding-step hidden" data-step="search">
+                <h2>Web search (recommended)</h2>
                 <p class="onboarding-hint">
                     Athen can search the web to back up its answers and check facts.
                     A keyless DuckDuckGo fallback is built in, but it rate-limits often —
                     plug in a free Brave or Tavily key for far better results. You can
                     add both: Athen uses whichever is available.
                 </p>
-                <details class="onb-help" style="margin-bottom: 12px;">
+                <details class="onb-help">
                     <summary>Where do I get these keys?</summary>
-                    <ul style="margin: 8px 0 0 16px; padding: 0; font-size: 0.9em; opacity: 0.85;">
+                    <ul class="onb-help-list">
                         <li><strong>Brave</strong>: sign up at <code>api.search.brave.com</code> — 2,000 free queries/month, no card required.</li>
                         <li><strong>Tavily</strong>: sign up at <code>tavily.com</code> — ~1,000 free queries/month, answer-ready snippets.</li>
                     </ul>
@@ -2120,8 +2120,8 @@
                 </div>
             </div>
 
-            <div class="onboarding-step" data-step="runtimes" style="display: none;">
-                <h1>Python &amp; Node</h1>
+            <div class="onboarding-step hidden" data-step="runtimes">
+                <h2>Python &amp; Node</h2>
                 <p class="onboarding-hint">
                     Athen installs and runs small scripts to do things like
                     parse PDFs, build charts, or scrape pages. It needs Python
@@ -2149,7 +2149,7 @@
                         </div>
                     </div>
                 </div>
-                <p class="onboarding-hint" style="margin-top: 12px; font-size: 0.85em; opacity: 0.7;">
+                <p class="onboarding-hint onboarding-hint-small">
                     You can do this later from Settings if you'd rather skip
                     for now.
                 </p>
@@ -2159,8 +2159,8 @@
                 </div>
             </div>
 
-            <div class="onboarding-step" data-step="identity" style="display: none;">
-                <h1>Who are you?</h1>
+            <div class="onboarding-step hidden" data-step="identity">
+                <h2>Who are you?</h2>
                 <p class="onboarding-hint">
                     Athen distinguishes messages from you vs. anyone else to handle risk correctly — your own messages get auto-trusted, everyone else's go through the approval flow. Tell Athen how to recognize you across channels.
                 </p>
@@ -2172,10 +2172,10 @@
                 <div class="setting-actions">
                     <button class="btn-secondary" id="onb-owner-add-identifier-btn">+ Add identifier</button>
                 </div>
-                <p class="onboarding-hint" style="margin-top: 1.5em; opacity: 0.7;">
+                <p class="onboarding-hint onboarding-hint-spaced">
                     Athen runs entirely on your machine. No telemetry, no analytics, nothing leaves your computer — this info is stored locally in your encrypted Athen database and used only to recognize you.
                 </p>
-                <div id="onb-owner-error" class="setting-hint" style="display:none; color: var(--danger);"></div>
+                <div id="onb-owner-error" class="setting-hint setting-hint-danger hidden"></div>
                 <div class="onboarding-buttons">
                     <button id="onb-back-identity" class="btn-secondary">Back</button>
                     <button id="onb-skip-identity" class="btn-secondary">Skip for now</button>
@@ -2183,8 +2183,8 @@
                 </div>
             </div>
 
-            <div class="onboarding-step" data-step="done" style="display: none;">
-                <h1>You're all set</h1>
+            <div class="onboarding-step hidden" data-step="done">
+                <h2>You're all set</h2>
                 <p class="onboarding-hint">
                     Athen is ready. To connect email, calendar, or Telegram later,
                     switch to the <strong>Athen Setup</strong> profile in the chat
@@ -2205,47 +2205,47 @@
 
     <!-- Provider help modal (L1 self-support) -->
     <div id="provider-help-modal-overlay" class="profile-modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="provider-help-modal-title">
-        <div class="profile-modal" style="max-width:520px">
+        <div class="profile-modal profile-modal-md">
             <div class="profile-modal-header">
                 <h2 id="provider-help-modal-title">Setup Help</h2>
                 <button id="provider-help-modal-close" class="profile-modal-close">&times;</button>
             </div>
-            <div class="profile-modal-body" id="provider-help-modal-body" style="padding:16px 20px"></div>
+            <div class="profile-modal-body profile-modal-body-padded" id="provider-help-modal-body"></div>
         </div>
     </div>
 
     <!-- Bundled embedding download modal -->
     <div id="bundled-emb-modal-overlay" class="profile-modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="bundled-emb-modal-title">
-        <div class="profile-modal" style="max-width:460px">
+        <div class="profile-modal profile-modal-sm">
             <div class="profile-modal-header">
                 <h2 id="bundled-emb-modal-title">Downloading model</h2>
             </div>
-            <div class="profile-modal-body" style="padding:16px 20px">
-                <p id="bundled-emb-modal-msg" style="margin:0 0 12px;color:var(--text-2);font-size:13px;line-height:1.55">
+            <div class="profile-modal-body profile-modal-body-padded">
+                <p id="bundled-emb-modal-msg" class="bundled-emb-modal-msg">
                     Downloading model &mdash; this may take 1&ndash;5 minutes depending on your connection.
                 </p>
                 <div class="bundled-emb-spinner" aria-hidden="true"></div>
-                <p id="bundled-emb-modal-phase" style="margin:12px 0 0;color:var(--text-3);font-size:12px;font-family:var(--mono)"></p>
+                <p id="bundled-emb-modal-phase" class="bundled-emb-modal-phase"></p>
             </div>
         </div>
     </div>
 
     <!-- Goal modal -->
-    <div id="goal-modal-overlay" class="goal-modal-overlay hidden" role="dialog" aria-modal="true">
+    <div id="goal-modal-overlay" class="goal-modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="goal-modal-title">
         <div class="goal-modal">
             <div class="goal-modal-header">
-                <h2>Set a Goal</h2>
+                <h2 id="goal-modal-title">Set a Goal</h2>
                 <button id="goal-modal-close" class="close-btn" aria-label="Close">&times;</button>
             </div>
             <div class="goal-modal-body">
                 <label for="goal-task-input">What should Athen accomplish?</label>
                 <textarea id="goal-task-input" rows="3" placeholder="e.g. Refactor the auth module and add comprehensive tests"></textarea>
-                <label for="goal-criteria-input">How will you know it's done? <span style="opacity:0.5">(optional)</span></label>
+                <label for="goal-criteria-input">How will you know it's done? <span class="label-optional">(optional)</span></label>
                 <textarea id="goal-criteria-input" rows="2" placeholder="e.g. All tests pass, no clippy warnings, functions under 50 lines"></textarea>
             </div>
             <div class="goal-modal-actions">
                 <button id="goal-cancel-btn">Cancel</button>
-                <button id="goal-save-btn" class="btn-primary">Set Goal</button>
+                <button id="goal-save-btn" class="btn-primary">Set goal</button>
             </div>
         </div>
     </div>

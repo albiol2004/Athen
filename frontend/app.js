@@ -455,7 +455,7 @@ function registerTauriEventListeners() {
                         invoke('get_arc_goal').then((gs) => {
                             currentGoalState = gs || null;
                             updateGoalBanner(currentGoalState);
-                        }).catch(() => {});
+                        }).catch((e) => console.warn('[athen] goal banner refresh failed:', e));
                     }
                     return; // consumed — don't append to streaming text
                 }
@@ -606,11 +606,15 @@ function registerTauriEventListeners() {
                 }
                 currentGoalState = newGoal || null;
                 updateGoalBanner(currentGoalState);
-            } catch (_) {}
+            } catch (e) {
+                console.warn('[athen] get_arc_goal failed:', e);
+            }
             try {
                 const plan = await invoke('get_plan');
                 updatePlanBanner(plan);
-            } catch (_) {}
+            } catch (e) {
+                console.warn('[athen] get_plan failed:', e);
+            }
         }
     });
 
@@ -884,7 +888,7 @@ function initTauri() {
             startInitialDataLoads();
         }));
     } else {
-        setStatus('working', 'Waiting for Tauri...');
+        setStatus('working', 'Waiting for Tauri…');
         setTimeout(initTauri, 100);
     }
 }
@@ -897,7 +901,8 @@ function startInitialDataLoads() {
         activeArcId = sid;
         loadArcs();
         loadHistory();
-    }).catch(() => {
+    }).catch((e) => {
+        console.warn('[athen] get_current_arc failed during init:', e);
         loadHistory();
     }).finally(() => {
         // Profile list is non-critical — defer so the chat UI paints first.
@@ -939,7 +944,10 @@ function startInitialDataLoads() {
         try {
             const settings = await invoke('get_settings');
             updateComposerVisionGate(settings.providers);
-        } catch (_) { /* non-critical */ }
+        } catch (e) {
+            // Non-critical: the gate re-syncs when Settings opens.
+            console.warn('[athen] composer vision-gate sync failed:', e);
+        }
     });
 }
 
@@ -1663,7 +1671,10 @@ async function refreshCodeModeAgents() {
                 if (codeModeAgentsState.expanded.has(arcId)) {
                     renderTranscriptInto(entries || [], container);
                 }
-            } catch (_) { /* transient; next poll retries */ }
+            } catch (e) {
+                // Transient; next poll retries.
+                console.warn('[athen] transcript poll failed:', e);
+            }
         }
     }
 
@@ -1842,13 +1853,13 @@ async function discardCodeModeChanges(body, btn, path) {
     const confirmed = await showConfirmDialog(single
         ? {
             title: 'Discard changes?',
-            body: 'Discard changes to ' + escapeDiscardPath(path) + '? This cannot be undone.',
+            body: 'Changes to ' + escapeDiscardPath(path) + ' will be discarded. This cannot be undone.',
             confirmLabel: 'Discard',
             danger: true,
         }
         : {
             title: 'Discard all changes?',
-            body: 'Discard ALL uncommitted changes in this repository? This permanently removes every modification and new file. This cannot be undone.',
+            body: 'Every uncommitted modification and new file in this repository will be removed. This cannot be undone.',
             confirmLabel: 'Discard all',
             danger: true,
         });
@@ -2598,14 +2609,19 @@ async function handleDeleteArc(arcId) {
     }
 }
 
+const WELCOME_ICON_ATTRS = 'viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"';
 const WELCOME_SUGGESTIONS = [
-    { icon: '📥', label: 'Triage my inbox',
+    { icon: `<svg ${WELCOME_ICON_ATTRS}><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg>`,
+      label: 'Triage my inbox',
       prompt: 'Triage my inbox and summarize what needs my attention.' },
-    { icon: '📅', label: 'Plan my day',
+    { icon: `<svg ${WELCOME_ICON_ATTRS}><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>`,
+      label: 'Plan my day',
       prompt: "What's on my calendar today, and what should I focus on?" },
-    { icon: '✍️', label: 'Draft a message',
+    { icon: `<svg ${WELCOME_ICON_ATTRS}><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>`,
+      label: 'Draft a message',
       prompt: 'Help me draft a message: ' },
-    { icon: '🔎', label: 'Research a topic',
+    { icon: `<svg ${WELCOME_ICON_ATTRS}><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>`,
+      label: 'Research a topic',
       prompt: 'Research this topic for me: ' },
 ];
 
@@ -2823,7 +2839,7 @@ async function autoNameArc(message) {
         if (lastSpace > 15) {
             name = name.substring(0, lastSpace);
         }
-        name += '...';
+        name += '…';
     }
 
     try {
@@ -3473,8 +3489,9 @@ async function ensureSkillsListLoaded() {
     if (skillsList && skillsList.length > 0) return;
     try {
         skillsList = (await invoke('list_skills')) || [];
-    } catch (_) {
-        // silently fail — list stays empty
+    } catch (e) {
+        // List stays empty; the slash-command menu just omits skills.
+        console.warn('[athen] list_skills failed:', e);
     }
 }
 
@@ -3755,7 +3772,7 @@ async function handleApproval(taskId, approved, clickedBtn) {
     if (clickedBtn) clickedBtn.classList.add('btn-pending');
 
     setInputEnabled(false);
-    setStatus('working', approved ? 'Executing approved action...' : 'Cancelling...');
+    setStatus('working', approved ? 'Executing approved action…' : 'Cancelling…');
 
     // Reset tool container and streaming state for approval execution.
     currentToolContainer = null;
@@ -3883,7 +3900,7 @@ function refreshComposerImagesUI() {
         chip.className = 'composer-file-chip';
         chip.dataset.tip = `${att.name} (${att.mime_type}, ${fmtBytes(att.size)})`;
         chip.innerHTML = `
-            <span class="composer-file-icon" aria-hidden="true">📄</span>
+            <span class="composer-file-icon" aria-hidden="true"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/></svg></span>
             <span class="composer-file-name">${att.name}</span>
             <span class="composer-file-size">${fmtBytes(att.size)}</span>
             <button type="button" class="composer-attachment-remove" aria-label="Remove file" data-id="${att.id}">×</button>
@@ -4197,7 +4214,7 @@ formEl.addEventListener('submit', async (e) => {
                         return;
                     }
                     try {
-                        setStatus('working', 'Planning...');
+                        setStatus('working', 'Planning…');
                         setQueueMode();
                         const response = await invoke('start_plan', { description: arg });
                         setStatus('idle', 'Ready');
@@ -4283,7 +4300,7 @@ formEl.addEventListener('submit', async (e) => {
     // messages. The submit handler routes through `queue_user_input` while
     // `isProcessing` is true. Escape / Stop still hard-cancels.
     setQueueMode();
-    setStatus('working', 'Thinking...');
+    setStatus('working', 'Thinking…');
 
     // Reset tool container and streaming state for this new request.
     currentToolContainer = null;
@@ -4423,7 +4440,7 @@ stopBtn.addEventListener('click', () => {
     invoke('cancel_task').catch((err) => {
         console.error('Failed to cancel task:', err);
     });
-    setStatus('working', 'Cancelling...');
+    setStatus('working', 'Cancelling…');
 });
 
 document.addEventListener('keydown', (e) => {
@@ -4431,7 +4448,7 @@ document.addEventListener('keydown', (e) => {
         invoke('cancel_task').catch((err) => {
             console.error('Failed to cancel task:', err);
         });
-        setStatus('working', 'Cancelling...');
+        setStatus('working', 'Cancelling…');
     }
 });
 
@@ -4668,7 +4685,7 @@ function buildToolCardBlock(meta) {
 
         const body = document.createElement('div');
         body.className = 'sub-agent-steps-body';
-        body.textContent = 'Loading...';
+        body.textContent = 'Loading…';
         details.appendChild(body);
 
         let loaded = false;
@@ -4762,7 +4779,8 @@ function buildDelegateFinalMessage(result) {
         && result.verification_note.trim()) {
         const warn = document.createElement('div');
         warn.className = 'delegate-final-warning';
-        warn.textContent = '⚠ ' + result.verification_note.trim();
+        warn.innerHTML = '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="vertical-align:-2px;margin-right:4px"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>'
+            + escapeHtml(result.verification_note.trim());
         block.appendChild(warn);
     }
 
@@ -5523,7 +5541,8 @@ function renderCalendarList(args, result) {
             if (e.location) {
                 const loc = document.createElement('div');
                 loc.className = 'event-location';
-                loc.textContent = '📍 ' + e.location;
+                loc.innerHTML = '<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="vertical-align:-1px;margin-right:4px"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/></svg>'
+                    + escapeHtml(e.location);
                 row.appendChild(loc);
             }
             if (e.category) {
@@ -6139,7 +6158,7 @@ function renderToolBody_submit_plan(args, result, toolCardEl) {
         // "Executing..." before the auto-send turn runs.
         withButtonPending(approveBtn, async () => {
             await invoke('approve_plan');
-            approveBtn.textContent = 'Executing...';
+            approveBtn.textContent = 'Executing…';
             // Plan is now executing — keep it locked even after the helper's
             // finally re-enables, so a second click can't re-approve.
             approveBtn.dataset.locked = '1';
@@ -6148,7 +6167,9 @@ function renderToolBody_submit_plan(args, result, toolCardEl) {
             try {
                 const plan = await invoke('get_plan');
                 updatePlanBanner(plan);
-            } catch (_) {}
+            } catch (e) {
+                console.warn('[athen] plan banner refresh failed:', e);
+            }
             showToast('Plan approved — executing', 'success');
             // Auto-send execution message
             await invoke('send_message', { message: 'Execute the plan step by step.' });
@@ -6303,7 +6324,7 @@ function buildToolCard(meta) {
     const iconMarkup = `<span class="tool-mark">${icon}</span>`;
     let detailHtml = '';
     if (summaryText) {
-        const truncated = summaryText.length > 80 ? summaryText.substring(0, 80) + '...' : summaryText;
+        const truncated = summaryText.length > 80 ? summaryText.substring(0, 80) + '…' : summaryText;
         detailHtml = `<span class="tool-detail">${escapeHtml(truncated)}</span>`;
     }
     card.innerHTML =
@@ -8095,7 +8116,7 @@ function showRewindDialog(entryId, newText, cleanupFn) {
 
     confirmBtn.addEventListener('click', async () => {
         confirmBtn.disabled = true;
-        confirmBtn.textContent = 'Rewinding...';
+        confirmBtn.textContent = 'Rewinding…';
         const revert = checkbox.checked;
         close();
         cleanupFn();
@@ -8503,7 +8524,7 @@ const CUSTOM_PROVIDER_ENTRY = {
     provider_type: 'cloud',
     default_base_url: '',
     default_model: '',
-    api_key_hint: 'sk-...',
+    api_key_hint: 'sk-…',
 };
 
 function providerById(id) {
@@ -8629,6 +8650,7 @@ function returnToChatIfOnSubView() {
 
 async function loadSettings() {
     if (!invoke) return;
+    settingsDirtySuppress = true;
     try {
         const settings = await invoke('get_settings');
         renderProviders(settings.providers);
@@ -8698,9 +8720,9 @@ async function loadSettings() {
                 document.getElementById('notif-quiet-end-hour').value = settings.notifications.quiet_end_hour;
                 document.getElementById('notif-quiet-end-minute').value = settings.notifications.quiet_end_minute;
                 document.getElementById('notif-quiet-allow-critical').checked = settings.notifications.quiet_allow_critical;
-                document.getElementById('quiet-hours-fields').style.display = 'block';
+                document.getElementById('quiet-hours-fields').classList.remove('hidden');
             } else {
-                document.getElementById('quiet-hours-fields').style.display = 'none';
+                document.getElementById('quiet-hours-fields').classList.add('hidden');
             }
             renderChannelOrder(settings.notifications.preferred_channels || []);
         }
@@ -8733,7 +8755,7 @@ async function loadSettings() {
             if (settings.embeddings.mode === 'Specific') {
                 const adv = document.getElementById('embedding-advanced');
                 const arrow = document.querySelector('#embedding-advanced-toggle .advanced-arrow');
-                if (adv) adv.style.display = 'block';
+                if (adv) adv.classList.remove('hidden');
                 if (arrow) arrow.textContent = '\u25BC';
             }
             // Reveal the Built-in sub-panel if Bundled is the saved mode.
@@ -8781,6 +8803,11 @@ async function loadSettings() {
     } catch (err) {
         console.error('Failed to load settings:', err);
         showToast('Failed to load settings: ' + err, 'error');
+    } finally {
+        settingsDirtySuppress = false;
+        // Repopulating replaced any pending edits — the form now matches
+        // the saved state, so no panel is dirty.
+        settingsDirtySections.clear();
     }
 }
 
@@ -9671,6 +9698,7 @@ function buildIdentityEntryCard(entry, cat) {
     delBtn.addEventListener('click', async () => {
         if (!(await showConfirmDialog({
             title: 'Delete this entry?',
+            body: 'The entry is removed from your identity. This cannot be undone.',
             confirmLabel: 'Delete',
             danger: true,
         }))) return;
@@ -9766,10 +9794,11 @@ async function deleteIdentityCategory(cat) {
     const count = identityEntries.filter((e) => e.category === cat.name).length;
     const msg =
         count > 0
-            ? `Delete category "${cat.name}" and its ${count} entrie${count === 1 ? 'y' : 's'}?`
+            ? `Delete category "${cat.name}" and its ${count} ${count === 1 ? 'entry' : 'entries'}?`
             : `Delete category "${cat.name}"?`;
     if (!(await showConfirmDialog({
         title: msg,
+        body: 'The category and its entries are removed from your identity. This cannot be undone.',
         confirmLabel: 'Delete',
         danger: true,
     }))) return;
@@ -10769,6 +10798,7 @@ async function refreshRemoteAccessStatus() {
         try {
             await invoke('set_remote_access', args);
             showToast('Remote access settings saved', 'success');
+            clearSettingsDirty(saveBtn);
             if (passwordEl) {
                 passwordEl.value = '';
                 passwordEl.placeholder = 'leave blank to keep current password';
@@ -10890,7 +10920,7 @@ function formatRelativeTime(iso) {
 async function handleClearToolbox() {
     const ok = await showConfirmDialog({
         title: 'Clear the toolbox?',
-        body: 'Remove every package the agent has installed in ~/.athen/toolbox? This cannot be undone.',
+        body: 'This removes every package the agent has installed in ~/.athen/toolbox. This cannot be undone.',
         confirmLabel: 'Remove all',
         danger: true,
     });
@@ -10993,7 +11023,7 @@ function createMcpCard(entry) {
         actions.className = 'setting-actions';
         const saveBtn = document.createElement('button');
         saveBtn.className = 'btn-primary';
-        saveBtn.textContent = 'Save Configuration';
+        saveBtn.textContent = 'Save configuration';
         saveBtn.addEventListener('click', () => handleSaveMcpConfig(card, entry));
         actions.appendChild(saveBtn);
         body.appendChild(actions);
@@ -11498,7 +11528,7 @@ async function handleSaveBundle(card, id) {
     if (!invoke) return;
     const saveBtn = card.querySelector('.bundle-save-btn');
     saveBtn.disabled = true;
-    saveBtn.textContent = 'Saving...';
+    saveBtn.textContent = 'Saving…';
     try {
         await persistBundle(card, id);
         showToast('Bundle saved', 'success');
@@ -11666,7 +11696,7 @@ function createProviderCard(provider) {
     } else {
         const setActiveBtn = document.createElement('button');
         setActiveBtn.className = 'btn-set-active';
-        setActiveBtn.textContent = 'Set Active';
+        setActiveBtn.textContent = 'Set active';
         setActiveBtn.addEventListener('click', (e) => {
             e.stopPropagation();
             handleSetActiveProvider(provider.id, provider.name);
@@ -11713,7 +11743,7 @@ function createProviderCard(provider) {
             <label>API Key</label>
             <div class="api-key-wrapper">
                 <input type="password" class="provider-api-key" placeholder="${provider.has_api_key ? 'Key is set (leave blank to keep)' : 'Enter API key'}" autocomplete="off">
-                <button class="api-key-toggle" data-tip="Show/hide key" aria-label="Show/hide key">&#128065;</button>
+                <button class="api-key-toggle" data-tip="Show/hide key" aria-label="Show/hide key"><svg class="icon-eye" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg><svg class="icon-eye-off" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg></button>
             </div>
             ${provider.api_key_hint ? `<div class="api-key-hint">Current: ${escapeHtml(provider.api_key_hint)}</div>` : ''}
         </div>
@@ -11766,7 +11796,7 @@ function createProviderCard(provider) {
             </div>
         </div>
         <div class="provider-card-actions">
-            <button class="btn-secondary test-btn">Test Connection</button>
+            <button class="btn-secondary test-btn">Test connection</button>
             <button class="btn-primary save-btn">Save</button>
             <button class="btn-danger delete-btn">Delete</button>
             <span class="test-result"></span>
@@ -11905,7 +11935,7 @@ async function handleSaveProvider(card, id) {
 
     const saveBtn = card.querySelector('.save-btn');
     saveBtn.disabled = true;
-    saveBtn.textContent = 'Saving...';
+    saveBtn.textContent = 'Saving…';
 
     try {
         const msg = await invoke('save_provider', {
@@ -11987,7 +12017,7 @@ async function handleTestProvider(card, id) {
     const testBtn = card.querySelector('.test-btn');
     const resultEl = card.querySelector('.test-result');
     testBtn.disabled = true;
-    testBtn.textContent = 'Testing...';
+    testBtn.textContent = 'Testing…';
     resultEl.textContent = '';
     resultEl.className = 'test-result';
 
@@ -12006,7 +12036,7 @@ async function handleTestProvider(card, id) {
     }
 
     testBtn.disabled = false;
-    testBtn.textContent = 'Test Connection';
+    testBtn.textContent = 'Test connection';
 }
 
 // Add provider template buttons — rendered dynamically from the catalog
@@ -12088,19 +12118,20 @@ if (saveSecurityBtn) {
     saveSecurityBtn.addEventListener('click', async () => {
         if (!invoke) return;
         saveSecurityBtn.disabled = true;
-        saveSecurityBtn.textContent = 'Saving...';
+        saveSecurityBtn.textContent = 'Saving…';
 
         try {
             const msg = await invoke('save_settings', {
                 securityMode: securityModeEl.value,
             });
             showToast(msg, 'success');
+            clearSettingsDirty(saveSecurityBtn);
         } catch (err) {
             showToast('Failed to save: ' + err, 'error');
         }
 
         saveSecurityBtn.disabled = false;
-        saveSecurityBtn.textContent = 'Save Security Settings';
+        saveSecurityBtn.textContent = 'Save security settings';
     });
 }
 
@@ -12120,7 +12151,7 @@ if (settingsBtn) {
     settingsBtn.addEventListener('click', showSettings);
 }
 if (settingsBack) {
-    settingsBack.addEventListener('click', showChat);
+    settingsBack.addEventListener('click', () => guardSettingsNav(showChat));
 }
 
 // ─── Custom titlebar window controls ───
@@ -12268,7 +12299,8 @@ function buildSettingsRails() {
             link.dataset.target = section.id;
             link.textContent = h2.textContent.trim();
             link.addEventListener('click', () => {
-                setSettingsSection(pane, section.id);
+                if (link.classList.contains('active')) return;
+                guardSettingsNav(() => setSettingsSection(pane, section.id));
             });
             rail.appendChild(link);
         });
@@ -12288,8 +12320,73 @@ function buildSettingsRails() {
 buildSettingsRails();
 
 document.querySelectorAll('.settings-tab').forEach((btn) => {
-    btn.addEventListener('click', () => setSettingsTab(btn.dataset.settingsTab));
+    btn.addEventListener('click', () => {
+        if (btn.classList.contains('active')) return;
+        guardSettingsNav(() => setSettingsTab(btn.dataset.settingsTab));
+    });
 });
+
+// ─── Settings dirty-state guard ───
+// Panels with an explicit Save button confirm before navigation discards
+// unsaved edits. Auto-persist panels (Bundles, Appearance, ...) and
+// add-item flows (Calendar Sources) are exempt by omission.
+const SETTINGS_SAVE_BUTTON_IDS = [
+    'save-embedding-btn', 'ra-save', 'save-owner-contact-btn',
+    'test-and-save-btn', 'save-email-btn', 'save-smtp-btn',
+    'save-telegram-btn', 'save-gh-bot-btn', 'save-gh-user-btn',
+    'save-web-search-btn', 'voice-save-btn', 'save-attachment-policy-btn',
+    'save-notif-btn', 'save-security-btn',
+];
+
+// Section ids that contain a Save button. buildSettingsRails has already
+// run at this point, so every heading-bearing section has an id.
+const guardedSettingsSectionIds = new Set();
+SETTINGS_SAVE_BUTTON_IDS.forEach((btnId) => {
+    const section = document.getElementById(btnId)?.closest('.settings-section');
+    if (section && section.id) guardedSettingsSectionIds.add(section.id);
+});
+
+const settingsDirtySections = new Set();
+// True while loadSettings() repopulates the form, so programmatic value
+// churn can never mark a panel dirty.
+let settingsDirtySuppress = false;
+
+function clearSettingsDirty(el) {
+    const section = el?.closest?.('.settings-section');
+    if (section && section.id) settingsDirtySections.delete(section.id);
+}
+
+function onSettingsFormEdit(e) {
+    if (settingsDirtySuppress) return;
+    const t = e.target;
+    if (!t || typeof t.closest !== 'function') return;
+    if (!t.matches('input, select, textarea')) return;
+    const section = t.closest('.settings-section');
+    if (section && guardedSettingsSectionIds.has(section.id)) {
+        settingsDirtySections.add(section.id);
+    }
+}
+settingsView?.addEventListener('input', onSettingsFormEdit);
+settingsView?.addEventListener('change', onSettingsFormEdit);
+
+// Runs `proceed` immediately when no panel is dirty; otherwise asks
+// first. On confirmed discard the settings form is reloaded (when still
+// visible) so the stale edits don't linger in the DOM behind a clean
+// flag; leaving settings entirely relies on showSettings() reloading.
+function guardSettingsNav(proceed) {
+    if (settingsDirtySections.size === 0) { proceed(); return; }
+    showConfirmDialog({
+        title: 'Discard unsaved changes?',
+        body: 'You have unsaved edits in Settings. Leaving discards them.',
+        confirmLabel: 'Discard',
+        danger: true,
+    }).then((confirmed) => {
+        if (!confirmed) return;
+        settingsDirtySections.clear();
+        proceed();
+        if (!settingsView.classList.contains('hidden')) loadSettings();
+    });
+}
 
 (function restoreSettingsTab() {
     let stored = null;
@@ -12511,7 +12608,7 @@ function showNotificationToast(data) {
                 handleSwitchArc(data.arc_id);
                 toast.remove();
                 if (data.id && invoke) {
-                    invoke('mark_notification_seen', { id: data.id }).then(() => updateNotifBadge()).catch(() => {});
+                    invoke('mark_notification_seen', { id: data.id }).then(() => updateNotifBadge()).catch((e) => console.warn('[athen] mark_notification_seen failed:', e));
                 }
             }
         });
@@ -12647,7 +12744,7 @@ function showProactiveHintCard(hint) {
         e.stopPropagation();
         card.remove();
         if (invoke) {
-            invoke('dismiss_hint', { hintId: hint.hint_id, permanent: true }).catch(() => {});
+            invoke('dismiss_hint', { hintId: hint.hint_id, permanent: true }).catch((e) => console.warn('[athen] dismiss_hint failed:', e));
         }
     });
     actions.appendChild(dontShowBtn);
@@ -12690,6 +12787,7 @@ document.getElementById('save-email-btn')?.addEventListener('click', async funct
             lookbackHours: parseInt(document.getElementById('email-lookback').value) || 24,
         });
         showEmailTestResult(true, result);
+        clearSettingsDirty(this);
     } catch (e) {
         showEmailTestResult(false, e.toString());
     }
@@ -12698,7 +12796,7 @@ document.getElementById('save-email-btn')?.addEventListener('click', async funct
 document.getElementById('test-email-btn')?.addEventListener('click', async function() {
     const btn = this;
     btn.disabled = true;
-    btn.textContent = 'Testing...';
+    btn.textContent = 'Testing…';
     try {
         const result = await window.__TAURI__.core.invoke('test_email_connection', {
             imapServer: document.getElementById('email-imap-server').value,
@@ -12712,7 +12810,7 @@ document.getElementById('test-email-btn')?.addEventListener('click', async funct
         showEmailTestResult(false, e.toString());
     } finally {
         btn.disabled = false;
-        btn.textContent = 'Test Connection';
+        btn.textContent = 'Test connection';
     }
 });
 
@@ -12746,6 +12844,7 @@ document.getElementById('save-smtp-btn')?.addEventListener('click', async functi
             fromAddress: document.getElementById('email-from-address').value,
         });
         showSmtpTestResult(true, result);
+        clearSettingsDirty(this);
     } catch (e) {
         showSmtpTestResult(false, e.toString());
     }
@@ -12754,7 +12853,7 @@ document.getElementById('save-smtp-btn')?.addEventListener('click', async functi
 document.getElementById('test-smtp-btn')?.addEventListener('click', async function() {
     const btn = this;
     btn.disabled = true;
-    btn.textContent = 'Testing...';
+    btn.textContent = 'Testing…';
     try {
         const result = await window.__TAURI__.core.invoke('test_smtp_connection', {
             smtpServer: document.getElementById('email-smtp-server').value,
@@ -12895,13 +12994,12 @@ function renderProviderHintEmpty() {
     if (looksLikeFullEmail(username)) {
         const domain = emailDomain(username);
         box.className = 'email-provider-hint';
-        box.style.display = '';
         box.innerHTML = `
             <p class="email-provider-hint-title">No match for ${escapeHtml(domain || '')}</p>
             <p class="email-provider-hint-body">We don't recognise this provider — fill in the server settings under Advanced below, or hit Test &amp; Save to try common defaults.</p>
         `;
     } else {
-        box.style.display = 'none';
+        box.classList.add('hidden');
         box.innerHTML = '';
     }
 }
@@ -12911,7 +13009,6 @@ function renderProviderHint(hint) {
     if (!box) return;
     const isBridge = hint.auth_kind === 'bridge_required';
     box.className = 'email-provider-hint' + (isBridge ? ' email-provider-hint-warning' : '');
-    box.style.display = '';
 
     const parts = [];
     parts.push(`<p class="email-provider-hint-title">Detected: <span class="email-provider-hint-name">${escapeHtml(hint.display_name)}</span></p>`);
@@ -13160,6 +13257,7 @@ document.getElementById('test-and-save-btn')?.addEventListener('click', async fu
             const providerName = _lastProviderHint?.display_name || 'your email';
             showCombinedResultSuccess(`Connected to ${providerName} as ${username}.`, autoCorrectNote);
             refreshConnectedPill(true, username);
+            clearSettingsDirty(this);
         } catch (e) {
             const raw = (e && e.toString) ? e.toString() : String(e);
             showCombinedResultError(
@@ -13199,9 +13297,9 @@ function refreshConnectedPill(enabled, username) {
     if (!pill) return;
     if (enabled && username && username.trim() !== '') {
         pill.textContent = `Connected as ${username.trim()}`;
-        pill.style.display = '';
+        pill.classList.remove('hidden');
     } else {
-        pill.style.display = 'none';
+        pill.classList.add('hidden');
         pill.textContent = '';
     }
 }
@@ -13272,6 +13370,7 @@ document.getElementById('save-telegram-btn')?.addEventListener('click', async fu
             pollIntervalSecs: !isNaN(pollInterval) ? pollInterval : null,
         });
         showTelegramTestResult(true, result);
+        clearSettingsDirty(this);
     } catch (e) {
         showTelegramTestResult(false, e.toString());
     }
@@ -13280,7 +13379,7 @@ document.getElementById('save-telegram-btn')?.addEventListener('click', async fu
 document.getElementById('test-telegram-btn')?.addEventListener('click', async function() {
     const btn = this;
     btn.disabled = true;
-    btn.textContent = 'Testing...';
+    btn.textContent = 'Testing…';
     try {
         const result = await window.__TAURI__.core.invoke('test_telegram_connection', {
             botToken: document.getElementById('telegram-bot-token').value,
@@ -13290,7 +13389,7 @@ document.getElementById('test-telegram-btn')?.addEventListener('click', async fu
         showTelegramTestResult(false, e.toString());
     } finally {
         btn.disabled = false;
-        btn.textContent = 'Test Connection';
+        btn.textContent = 'Test connection';
     }
 });
 
@@ -13329,7 +13428,7 @@ async function loadGithubIdentities() {
                 tokenInput.value = '';
                 tokenInput.placeholder = slot.has_token
                     ? '(token saved — type to replace)'
-                    : 'github_pat_...';
+                    : 'github_pat_…';
             }
             if (hint) {
                 hint.textContent = slot.has_token
@@ -13366,6 +13465,7 @@ for (const which of ['bot', 'user']) {
                 userEmail: emailInput?.value ?? '',
             });
             showGhTestResult(which, true, result);
+            clearSettingsDirty(document.getElementById(`save-gh-${which}-btn`));
             await loadGithubIdentities();
         } catch (e) {
             showGhTestResult(which, false, e.toString());
@@ -13386,7 +13486,7 @@ for (const which of ['bot', 'user']) {
         }
         const origText = btn.textContent;
         btn.disabled = true;
-        btn.textContent = 'Testing...';
+        btn.textContent = 'Testing…';
         try {
             const result = await window.__TAURI__.core.invoke('test_github_identity', {
                 token: tokenVal,
@@ -13448,7 +13548,7 @@ function renderOwnerIdentifierRow(kind, value) {
 function clearOwnerContactError() {
     const errEl = document.getElementById('owner-contact-error');
     if (!errEl) return;
-    errEl.style.display = 'none';
+    errEl.classList.add('hidden');
     errEl.textContent = '';
 }
 
@@ -13456,7 +13556,7 @@ function showOwnerContactError(msg) {
     const errEl = document.getElementById('owner-contact-error');
     if (!errEl) return;
     errEl.textContent = msg;
-    errEl.style.display = 'block';
+    errEl.classList.remove('hidden');
 }
 
 function renderOwnerContact(view) {
@@ -13514,6 +13614,7 @@ document.getElementById('save-owner-contact-btn')?.addEventListener('click', asy
         const view = await invoke('save_owner_contact', { name, identifiers });
         renderOwnerContact(view);
         showToast('Contact info saved.', 'success');
+        clearSettingsDirty(btn);
     } catch (err) {
         showOwnerContactError(err && err.toString ? err.toString() : String(err));
     } finally {
@@ -13631,6 +13732,7 @@ document.getElementById('save-web-search-btn')?.addEventListener('click', async 
             tavilyApiKey: tavily === '' ? null : tavily,
         });
         showWebSearchTestResult(true, result);
+        clearSettingsDirty(this);
         await loadSettings();
     } catch (e) {
         showWebSearchTestResult(false, e.toString());
@@ -13692,6 +13794,7 @@ document
                 byteTtlDays: ttl,
             });
             showAttachmentPolicyResult(true, result);
+            clearSettingsDirty(this);
         } catch (e) {
             showAttachmentPolicyResult(false, e.toString());
         }
@@ -13757,7 +13860,7 @@ function getChannelOrder() {
 }
 
 document.getElementById('notif-quiet-hours-enabled')?.addEventListener('change', function() {
-    document.getElementById('quiet-hours-fields').style.display = this.checked ? 'block' : 'none';
+    document.getElementById('quiet-hours-fields').classList.toggle('hidden', !this.checked);
 });
 
 document.getElementById('save-notif-btn')?.addEventListener('click', async function() {
@@ -13777,6 +13880,7 @@ document.getElementById('save-notif-btn')?.addEventListener('click', async funct
         });
 
         showToast('Notification settings saved', 'success');
+        clearSettingsDirty(this);
     } catch (e) {
         console.error('Failed to save notification settings:', e);
         showToast('Failed to save notification settings: ' + e, 'error');
@@ -13797,11 +13901,11 @@ function toggleBundledEmbPanel(mode) {
     const panel = document.getElementById('bundled-emb-panel');
     if (!panel) return;
     if (mode === 'Bundled') {
-        panel.style.display = '';
+        panel.classList.remove('hidden');
         // Lazy-load state on first reveal — invoke is gated inside.
         loadBundledEmbState();
     } else {
-        panel.style.display = 'none';
+        panel.classList.add('hidden');
     }
 }
 
@@ -13815,11 +13919,11 @@ document.getElementById('embedding-advanced-toggle')?.addEventListener('click', 
     const adv = document.getElementById('embedding-advanced');
     const arrow = this.querySelector('.advanced-arrow');
     if (!adv) return;
-    if (adv.style.display === 'none') {
-        adv.style.display = 'block';
+    if (adv.classList.contains('hidden')) {
+        adv.classList.remove('hidden');
         if (arrow) arrow.textContent = '\u25BC';
     } else {
-        adv.style.display = 'none';
+        adv.classList.add('hidden');
         if (arrow) arrow.textContent = '\u25B6';
     }
 });
@@ -13834,9 +13938,9 @@ document.getElementById('embedding-key-toggle')?.addEventListener('click', funct
 document.getElementById('save-embedding-btn')?.addEventListener('click', async function() {
     const btn = this;
     btn.disabled = true;
-    btn.textContent = 'Saving...';
+    btn.textContent = 'Saving…';
 
-    const advVisible = document.getElementById('embedding-advanced')?.style.display !== 'none';
+    const advVisible = !document.getElementById('embedding-advanced')?.classList.contains('hidden');
     const provider = document.getElementById('embedding-provider')?.value || null;
     const model = document.getElementById('embedding-model')?.value || null;
     const baseUrl = document.getElementById('embedding-base-url')?.value || null;
@@ -13866,18 +13970,19 @@ document.getElementById('save-embedding-btn')?.addEventListener('click', async f
             apiKey: apiKey || null,
         });
         showToast(result, 'success');
+        clearSettingsDirty(btn);
     } catch (e) {
         showToast('Failed to save embedding settings: ' + e, 'error');
     } finally {
         btn.disabled = false;
-        btn.textContent = 'Save Embedding Settings';
+        btn.textContent = 'Save embedding settings';
     }
 });
 
 document.getElementById('test-embedding-btn')?.addEventListener('click', async function() {
     const btn = this;
     btn.disabled = true;
-    btn.textContent = 'Testing...';
+    btn.textContent = 'Testing…';
     try {
         const result = await window.__TAURI__.core.invoke('test_embedding_provider', {
             provider: document.getElementById('embedding-provider')?.value || 'ollama',
@@ -13890,7 +13995,7 @@ document.getElementById('test-embedding-btn')?.addEventListener('click', async f
         showEmbeddingTestResult(false, e.toString());
     } finally {
         btn.disabled = false;
-        btn.textContent = 'Test Connection';
+        btn.textContent = 'Test connection';
     }
 });
 
@@ -14353,7 +14458,7 @@ async function renderTimeline() {
                         const nodeColor = getTlEntryColor(entry.entry_type);
                         const typeIcon = getTlEntryIcon(entry.entry_type);
                         const preview = entry.content.length > 120
-                            ? entry.content.substring(0, 120) + '...'
+                            ? entry.content.substring(0, 120) + '…'
                             : entry.content;
                         const tooltipTime = new Date(entry.created_at).toLocaleString();
 
@@ -15181,6 +15286,7 @@ async function deleteCalendarEvent() {
 
     if (!(await showConfirmDialog({
         title: 'Delete this event?',
+        body: 'The event is removed from your calendar. This cannot be undone.',
         confirmLabel: 'Delete',
         danger: true,
     }))) return;
@@ -15561,12 +15667,13 @@ async function updateNotifBadge() {
         const badge = document.getElementById('notif-badge');
         if (unreadCount > 0) {
             badge.textContent = unreadCount;
-            badge.style.display = 'inline-flex';
+            badge.classList.remove('hidden');
         } else {
-            badge.style.display = 'none';
+            badge.classList.add('hidden');
         }
     } catch (e) {
-        // Ignore errors during badge updates
+        // Badge keeps its last state; the next refresh retries.
+        console.warn('[athen] notification badge update failed:', e);
     }
 }
 
@@ -16216,7 +16323,7 @@ async function toggleBlockContact(id, block) {
 async function deleteContact(id) {
     if (!(await showConfirmDialog({
         title: 'Delete this contact?',
-        body: 'Are you sure you want to delete this contact? This cannot be undone.',
+        body: 'The contact and its trust settings are removed. This cannot be undone.',
         confirmLabel: 'Delete',
         danger: true,
     }))) {
@@ -16492,6 +16599,7 @@ async function editMemory(id, btn) {
 async function deleteMemory(id) {
     if (!(await showConfirmDialog({
         title: 'Delete this memory?',
+        body: 'Athen will forget this permanently. This cannot be undone.',
         confirmLabel: 'Delete',
         danger: true,
     }))) return;
@@ -16591,6 +16699,7 @@ function renderEntities(entities) {
 async function deleteEntity(id) {
     if (!(await showConfirmDialog({
         title: 'Delete this entity and its relations?',
+        body: 'The entity and every relation pointing at it are removed. This cannot be undone.',
         confirmLabel: 'Delete',
         danger: true,
     }))) return;
@@ -16618,11 +16727,15 @@ function filterMemories(query) {
 // project-page tabs (which also carry .memory-tab for styling parity).
 document.querySelectorAll('#memory-view .memory-tab').forEach(tab => {
     tab.addEventListener('click', () => {
-        document.querySelectorAll('#memory-view .memory-tab').forEach(t => t.classList.remove('active'));
+        document.querySelectorAll('#memory-view .memory-tab').forEach(t => {
+            t.classList.remove('active');
+            t.setAttribute('aria-selected', 'false');
+        });
         tab.classList.add('active');
+        tab.setAttribute('aria-selected', 'true');
         const target = tab.dataset.tab;
-        document.getElementById('memories-panel').style.display = target === 'memories' ? '' : 'none';
-        document.getElementById('entities-panel').style.display = target === 'entities' ? '' : 'none';
+        document.getElementById('memories-panel').classList.toggle('hidden', target !== 'memories');
+        document.getElementById('entities-panel').classList.toggle('hidden', target !== 'entities');
     });
 });
 
@@ -16733,7 +16846,9 @@ async function createProjectFromName(name) {
 function setProjectTab(tab) {
     projectActiveTab = tab;
     document.querySelectorAll('#project-view .project-tab').forEach((t) => {
-        t.classList.toggle('active', t.dataset.ptab === tab);
+        const on = t.dataset.ptab === tab;
+        t.classList.toggle('active', on);
+        t.setAttribute('aria-selected', on ? 'true' : 'false');
     });
     const panels = {
         overview: 'project-panel-overview',
@@ -16744,7 +16859,7 @@ function setProjectTab(tab) {
     for (const [key, id] of Object.entries(panels)) {
         const el = document.getElementById(id);
         if (el) {
-            el.style.display = key === tab ? '' : 'none';
+            el.classList.toggle('hidden', key !== tab);
             // WebKitGTK retains scrollTop across an innerHTML/visibility swap;
             // reset when the panel becomes visible so fresh content starts top.
             if (key === tab) el.scrollTop = 0;
@@ -17167,7 +17282,7 @@ function ellipsizePath(p, maxLen = 60) {
     if (!p || p.length <= maxLen) return p;
     const head = Math.ceil((maxLen - 3) * 0.55);
     const tail = (maxLen - 3) - head;
-    return p.slice(0, head) + '...' + p.slice(p.length - tail);
+    return p.slice(0, head) + '…' + p.slice(p.length - tail);
 }
 
 function escapeHtml(s) {
@@ -17458,7 +17573,7 @@ function populateOnboardingProviderPickers() {
 
     for (const p of PROVIDER_CATALOG) {
         if (p.provider_type === 'cloud') {
-            ONB_CLOUD_HINTS[p.id] = p.api_key_hint || 'sk-...';
+            ONB_CLOUD_HINTS[p.id] = p.api_key_hint || 'sk-…';
             if (cloudSel) {
                 const opt = document.createElement('option');
                 opt.value = p.id;
@@ -17506,7 +17621,7 @@ function showOnboardingStep(name) {
     const overlay = document.getElementById('onboarding-overlay');
     if (!overlay) return;
     overlay.querySelectorAll('.onboarding-step').forEach((s) => {
-        s.style.display = s.dataset.step === name ? '' : 'none';
+        s.classList.toggle('hidden', s.dataset.step !== name);
     });
 
     const progress = document.getElementById('onb-progress');
@@ -17516,15 +17631,15 @@ function showOnboardingStep(name) {
             // Interactive mode only has the pick step — hide the progress
             // bar entirely since a single dot is meaningless.
             if (!onbManualMode) {
-                progress.style.display = 'none';
+                progress.classList.add('hidden');
             } else {
-                progress.style.display = '';
+                progress.classList.remove('hidden');
                 progress.querySelectorAll('.onb-progress-step').forEach((p) => {
                     p.classList.toggle('active', p.dataset.step === target);
                 });
             }
         } else {
-            progress.style.display = 'none';
+            progress.classList.add('hidden');
         }
     }
 }
@@ -17543,7 +17658,7 @@ async function finishOnboarding() {
         console.warn('[athen] complete_onboarding failed:', e);
     }
     const overlay = document.getElementById('onboarding-overlay');
-    if (overlay) overlay.style.display = 'none';
+    if (overlay) overlay.classList.add('hidden');
 }
 
 // "Skip for now" path. Deliberately does NOT mark onboarding permanently
@@ -17558,9 +17673,9 @@ async function skipOnboarding() {
         console.warn('[athen] skip_onboarding failed:', e);
     }
     const overlay = document.getElementById('onboarding-overlay');
-    if (overlay) overlay.style.display = 'none';
+    if (overlay) overlay.classList.add('hidden');
     // Surface the recovery CTA immediately on the empty chat.
-    try { await maybeShowNoProviderEmptyState(); } catch (_) {}
+    try { await maybeShowNoProviderEmptyState(); } catch (e) { console.warn('[athen] no-provider empty state failed:', e); }
 }
 
 async function finishOnboardingInteractive() {
@@ -17570,7 +17685,7 @@ async function finishOnboardingInteractive() {
         console.warn('[athen] complete_onboarding failed:', e);
     }
     const overlay = document.getElementById('onboarding-overlay');
-    if (overlay) overlay.style.display = 'none';
+    if (overlay) overlay.classList.add('hidden');
 
     try {
         const arcId = await invoke('create_setup_arc');
@@ -17664,7 +17779,7 @@ function wireOnboardingButtons() {
     });
     document.getElementById('onb-cloud-type')?.addEventListener('change', (e) => {
         const k = document.getElementById('onb-cloud-key');
-        if (k) k.placeholder = ONB_CLOUD_HINTS[e.target.value] || 'sk-...';
+        if (k) k.placeholder = ONB_CLOUD_HINTS[e.target.value] || 'sk-…';
     });
 
     document.getElementById('onb-local-test')?.addEventListener('click', async () => {
@@ -17726,7 +17841,7 @@ function wireOnboardingButtons() {
 async function enterMemoryStep() {
     showOnboardingStep('memory');
     onbMemSelected = null;
-    document.getElementById('onb-mem-config').style.display = 'none';
+    document.getElementById('onb-mem-config').classList.add('hidden');
     document.getElementById('onb-mem-status').textContent = '';
 
     const tierEl = document.getElementById('onb-device-tier');
@@ -17749,9 +17864,9 @@ function wireMemoryStep() {
 
     document.getElementById('onb-mem-cloud')?.addEventListener('click', () => {
         onbMemSelected = 'cloud';
-        document.getElementById('onb-mem-config').style.display = '';
-        document.getElementById('onb-mem-key-row').style.display = '';
-        document.getElementById('onb-mem-url-row').style.display = 'none';
+        document.getElementById('onb-mem-config').classList.remove('hidden');
+        document.getElementById('onb-mem-key-row').classList.remove('hidden');
+        document.getElementById('onb-mem-url-row').classList.add('hidden');
         const keyEl = document.getElementById('onb-mem-key');
         if (keyEl && !keyEl.value && onbCloudIdCache === 'openai') {
             keyEl.value = onbCloudKeyCache;
@@ -17761,9 +17876,9 @@ function wireMemoryStep() {
 
     document.getElementById('onb-mem-ollama')?.addEventListener('click', () => {
         onbMemSelected = 'ollama';
-        document.getElementById('onb-mem-config').style.display = '';
-        document.getElementById('onb-mem-key-row').style.display = 'none';
-        document.getElementById('onb-mem-url-row').style.display = '';
+        document.getElementById('onb-mem-config').classList.remove('hidden');
+        document.getElementById('onb-mem-key-row').classList.add('hidden');
+        document.getElementById('onb-mem-url-row').classList.remove('hidden');
         const urlEl = document.getElementById('onb-mem-url');
         if (urlEl && !urlEl.value) urlEl.value = 'http://localhost:11434';
         document.getElementById('onb-mem-model').placeholder = 'nomic-embed-text';
@@ -18062,7 +18177,7 @@ function appendOnbOwnerIdentifierRow(kind, value) {
 function clearOnbOwnerError() {
     const errEl = document.getElementById('onb-owner-error');
     if (!errEl) return;
-    errEl.style.display = 'none';
+    errEl.classList.add('hidden');
     errEl.textContent = '';
 }
 
@@ -18070,7 +18185,7 @@ function showOnbOwnerError(msg) {
     const errEl = document.getElementById('onb-owner-error');
     if (!errEl) return;
     errEl.textContent = msg;
-    errEl.style.display = 'block';
+    errEl.classList.remove('hidden');
 }
 
 async function enterIdentityStep() {
@@ -18169,12 +18284,12 @@ async function maybeRunOnboarding() {
         // Not a fresh install (or the user skipped). If they skipped without
         // configuring a provider, surface the recovery CTA on the empty chat
         // so the first message doesn't dead-end on "all providers exhausted".
-        try { await maybeShowNoProviderEmptyState(); } catch (_) {}
+        try { await maybeShowNoProviderEmptyState(); } catch (e) { console.warn('[athen] no-provider empty state failed:', e); }
         return;
     }
     const overlay = document.getElementById('onboarding-overlay');
     if (!overlay) return;
-    overlay.style.display = 'flex';
+    overlay.classList.remove('hidden');
     showOnboardingStep('welcome');
 }
 
@@ -18796,7 +18911,7 @@ function renderWakeupRow(w) {
     deleteBtn.addEventListener('click', async () => {
         if (!(await showConfirmDialog({
             title: 'Delete this wake-up?',
-            body: `"${w.instruction}"`,
+            body: `"${w.instruction}" will no longer fire. This cannot be undone.`,
             confirmLabel: 'Delete',
             danger: true,
         }))) return;
@@ -20808,7 +20923,7 @@ function scheduleFirstCalendarSourcesRefresh(retries = 50) {
 }
 
 function showCalendarSourceForm(visible) {
-    document.getElementById('calendar-source-form').style.display = visible ? '' : 'none';
+    document.getElementById('calendar-source-form').classList.toggle('hidden', !visible);
     if (!visible) {
         document.getElementById('calendar-source-form-result').classList.add('hidden');
     }
@@ -20870,7 +20985,10 @@ async function addCalendarSource() {
             resultEl.textContent = `Added. ${probe.message} Pulling events…`;
             resultEl.className = 'test-result success';
             // Kick off a first sync pass so the user sees events without waiting.
-            invoke('sync_calendar_source_now', { id: view.id }).catch(() => {});
+            invoke('sync_calendar_source_now', { id: view.id }).catch((e) => {
+                console.warn('[athen] initial calendar sync failed:', e);
+                showToast('Initial calendar sync failed — use "Sync now" to retry.', 'error');
+            });
         } else {
             resultEl.textContent = `Added, but connection test failed: ${probe.message}`;
             resultEl.className = 'test-result error';
@@ -21002,7 +21120,7 @@ async function openCalendarSourcePicker(id) {
 
     const listEl = document.getElementById('calendar-source-picker-list');
     listEl.innerHTML = '<p>Loading…</p>';
-    document.getElementById('calendar-source-picker').style.display = '';
+    document.getElementById('calendar-source-picker').classList.remove('hidden');
 
     try {
         const remote = await invoke('list_remote_calendars', { id });
@@ -21032,7 +21150,7 @@ async function openCalendarSourcePicker(id) {
 }
 
 function hideCalendarSourcePicker() {
-    document.getElementById('calendar-source-picker').style.display = 'none';
+    document.getElementById('calendar-source-picker').classList.add('hidden');
     calendarSourcePickerId = null;
 }
 
@@ -21389,6 +21507,15 @@ async function loadVoiceSetupStatus() {
     }
 }
 
+// Updates a voice-setup check row without clobbering its SVG icon span
+// (the hourglass/check icons are CSS-switched on is-pending/is-ok).
+function setVoiceCheck(el, stateClass, label) {
+    el.className = stateClass;
+    const labelEl = el.querySelector('.voice-check-label');
+    if (labelEl) labelEl.textContent = label;
+    else el.textContent = label;
+}
+
 function renderVoiceSetupChecks() {
     const setup = voiceState.setup;
     const statusEl = document.getElementById('voice-setup-status');
@@ -21403,22 +21530,18 @@ function renderVoiceSetupChecks() {
 
     if (pythonEl) {
         if (setup.pythonInstalled) {
-            pythonEl.className = 'is-ok';
-            pythonEl.textContent = '✓ Portable Python';
+            setVoiceCheck(pythonEl, 'is-ok', 'Portable Python');
         } else {
-            pythonEl.className = 'is-pending';
-            pythonEl.textContent = '⏳ Portable Python (will install)';
+            setVoiceCheck(pythonEl, 'is-pending', 'Portable Python (will install)');
         }
     }
     if (pipecatEl) {
         if (setup.pipecatInstalled) {
-            pipecatEl.className = 'is-ok';
-            pipecatEl.textContent = setup.pipecatVersion
-                ? `✓ Pipecat (audio runtime) — v${setup.pipecatVersion}`
-                : '✓ Pipecat (audio runtime)';
+            setVoiceCheck(pipecatEl, 'is-ok', setup.pipecatVersion
+                ? `Pipecat (audio runtime) — v${setup.pipecatVersion}`
+                : 'Pipecat (audio runtime)');
         } else {
-            pipecatEl.className = 'is-pending';
-            pipecatEl.textContent = '⏳ Pipecat (audio runtime)';
+            setVoiceCheck(pipecatEl, 'is-pending', 'Pipecat (audio runtime)');
         }
     }
 
@@ -21484,12 +21607,10 @@ function applyVoiceSetupProgress(progress) {
     const pythonEl = document.getElementById('voice-check-python');
     const pipecatEl = document.getElementById('voice-check-pipecat');
     if (phase === 'python_installing' && pythonEl) {
-        pythonEl.className = 'is-pending';
-        pythonEl.textContent = '… Portable Python (installing)';
+        setVoiceCheck(pythonEl, 'is-pending', 'Portable Python (installing)');
     }
     if (phase === 'pipecat_installing' && pipecatEl) {
-        pipecatEl.className = 'is-pending';
-        pipecatEl.textContent = '… Pipecat (installing)';
+        setVoiceCheck(pipecatEl, 'is-pending', 'Pipecat (installing)');
     }
 }
 
@@ -21539,7 +21660,7 @@ async function runVoiceInstall() {
     } finally {
         voiceState.installing = false;
         // Re-poll the canonical status (marker + filesystem) so the
-        // ✓/⏳ row reflects ground truth, not just the last event.
+        // ok/pending row reflects ground truth, not just the last event.
         loadVoiceSetupStatus();
     }
 }
@@ -21702,6 +21823,7 @@ function wireVoicePanel() {
             try {
                 await invoke('save_voice_settings', { config });
                 voiceState.config = config;
+                clearSettingsDirty(saveBtn);
                 if (status) {
                     status.className = 'voice-status voice-status-ok';
                     status.textContent = 'Voice config saved.';
@@ -21957,6 +22079,17 @@ document.addEventListener('click', (e) => {
     if (!btn) return;
     const action = EMPTY_STATE_ACTIONS[btn.dataset.emptyCta];
     if (action) action();
+});
+
+// Eye/eye-off icon state for every show-hide password toggle. The per-site
+// handlers flip input.type on the button's own listener; this document-level
+// listener runs after them (bubble order) and only syncs the icon class from
+// the input's resulting type — it never touches the input itself.
+document.addEventListener('click', (e) => {
+    const toggle = e.target.closest('.api-key-toggle');
+    if (!toggle) return;
+    const input = toggle.closest('.api-key-wrapper')?.querySelector('input');
+    if (input) toggle.classList.toggle('is-revealed', input.type === 'text');
 });
 
 // ─── Keyboard command layer ───
