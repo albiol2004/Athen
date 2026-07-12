@@ -96,10 +96,22 @@
        that sit over arbitrary app content — keeps the blur but raises opacity
        so text stays legible regardless of what's behind them. */
     --glass-bg-strong: rgba(19, 18, 18, 0.92);
+    /* Soft variant: a heavy translucent TINT with NO backdrop-filter — for
+       large content panes (#app) that must stay blur-free but should let the
+       static wallpaper glow through. Alpha compositing only; cheap. */
+    --glass-bg-soft: rgba(19, 18, 18, 0.86);
     --glass-blur:    blur(16px) saturate(1.4);
     --overlay-blur:  blur(4px);
     --glass-border:  rgba(255, 255, 255, 0.06);
     --glass-shimmer: rgba(255, 255, 255, 0.04) 0px 1px 0px 0px inset;
+
+    /* wallpaper — the fixed ambient layer behind everything (body::before).
+       Static by contract: never animated, never repainted after first paint. */
+    --wallpaper:
+        radial-gradient(ellipse 60% 50% at 0% 0%, rgba(194, 88, 104, 0.35) 0%, transparent 70%),
+        radial-gradient(ellipse 50% 60% at 100% 100%, rgba(80, 100, 200, 0.28) 0%, transparent 70%),
+        radial-gradient(ellipse 40% 50% at 100% 0%, rgba(215, 132, 113, 0.22) 0%, transparent 60%),
+        radial-gradient(ellipse 35% 40% at 50% 100%, rgba(160, 80, 180, 0.20) 0%, transparent 60%);
 }
 
 /* ─── Light theme ─── */
@@ -154,10 +166,19 @@
     /* glass */
     --glass-bg:      rgba(255, 255, 255, 0.55);
     --glass-bg-strong: rgba(255, 255, 255, 0.95);
+    --glass-bg-soft: rgba(255, 255, 255, 0.82);
     --glass-blur:    blur(24px) saturate(1.6);
     --overlay-blur:  blur(4px);
     --glass-border:  rgba(0, 0, 0, 0.06);
     --glass-shimmer: rgba(255, 255, 255, 0.9) 0px 1px 0px 0px inset;
+
+    /* wallpaper — slightly stronger orbs so frosted white panels still
+       show the colour washes through. */
+    --wallpaper:
+        radial-gradient(ellipse 60% 50% at 0% 0%, rgba(194, 88, 104, 0.22) 0%, transparent 70%),
+        radial-gradient(ellipse 50% 60% at 100% 100%, rgba(120, 80, 200, 0.16) 0%, transparent 70%),
+        radial-gradient(ellipse 40% 50% at 100% 0%, rgba(215, 132, 113, 0.15) 0%, transparent 60%),
+        radial-gradient(ellipse 35% 40% at 50% 100%, rgba(160, 80, 180, 0.12) 0%, transparent 60%);
 }
 
 /* ─── Reset & base ─── */
@@ -240,11 +261,24 @@ html, body {
 body {
     display: flex;
     flex-direction: column;
+    background: none;
+}
+
+/* ─── Ambient wallpaper layer ───
+   The one fixed, full-window background everything composites over: the
+   warm corner glows + a faint fractal-noise grain (inline SVG, opacity
+   baked into the SVG rect). position: fixed + z-index: -1 keeps it out
+   of every scroll container, so it paints once and never again — no
+   transitions, no animation, no pointer events by contract. */
+body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    z-index: -1;
+    pointer-events: none;
     background:
-        radial-gradient(ellipse 60% 50% at 0% 0%, rgba(194, 88, 104, 0.35) 0%, transparent 70%),
-        radial-gradient(ellipse 50% 60% at 100% 100%, rgba(80, 100, 200, 0.28) 0%, transparent 70%),
-        radial-gradient(ellipse 40% 50% at 100% 0%, rgba(215, 132, 113, 0.22) 0%, transparent 60%),
-        radial-gradient(ellipse 35% 40% at 50% 100%, rgba(160, 80, 180, 0.20) 0%, transparent 60%),
+        url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='120' height='120' filter='url(%23n)' opacity='0.05'/%3E%3C/svg%3E") repeat,
+        var(--wallpaper),
         var(--bg-deep);
 }
 
@@ -259,8 +293,14 @@ body {
     display: flex;
     align-items: center;
     padding: 0 12px;
-    background: transparent;
+    /* Glass chrome: backdrop is the fixed wallpaper only (body is transparent
+       here and nothing scrolls behind the titlebar), so the blur region is
+       static — it rasterizes once and never again. */
+    background: var(--glass-bg);
+    backdrop-filter: var(--glass-blur);
+    -webkit-backdrop-filter: var(--glass-blur);
     border-bottom: 1px solid var(--glass-border);
+    box-shadow: var(--glass-shimmer);
     user-select: none;
     -webkit-user-select: none;
     position: relative;
@@ -285,12 +325,12 @@ body {
     justify-content: center;
     color: transparent;
     border: 0.5px solid rgba(0, 0, 0, 0.25);
-    transition: filter var(--dur-fast) var(--ease);
     flex-shrink: 0;
 }
 
 .traffic-btn svg { width: 8px; height: 8px; opacity: 0; transition: opacity var(--dur-fast) var(--ease); }
-.traffic-btn:hover svg { opacity: 1; }
+/* macOS semantics: hovering anywhere on the group reveals ALL three symbols. */
+.titlebar-traffic:hover .traffic-btn svg { opacity: 1; }
 
 .traffic-close { background: #FF5F57; color: #4D0000; }
 .traffic-min   { background: #FEBC2E; color: #5A3E00; }
@@ -302,6 +342,21 @@ body {
 body.window-blurred .traffic-btn {
     background: #4A4754;
     border-color: rgba(0, 0, 0, 0.2);
+}
+
+/* Inactive-window dimming: glass chrome recedes like a macOS window that
+   lost focus. Opacity-only transition (budget rule 3); the traffic-light
+   grey swap above stays instant on purpose — color isn't opacity. */
+#titlebar,
+#app > header,
+.sidebar {
+    transition: opacity var(--dur) var(--ease);
+}
+
+body.window-blurred #titlebar,
+body.window-blurred #app > header,
+body.window-blurred .sidebar {
+    opacity: 0.8;
 }
 
 .titlebar-title {
@@ -429,10 +484,11 @@ a:hover { color: var(--brand-warm); }
     flex-direction: column;
     min-width: 0;
     min-height: 0;
-    /* Opaque background (no backdrop-filter): #app wraps the opaque scrolling
-       chat, so the blur was never visible but re-rasterized every scroll/stream
-       frame — a top cause of WebKitGTK jank on modest AMD GPUs. */
-    background: var(--surface-1);
+    /* Heavy translucent tint, NO backdrop-filter: blur on #app re-rasterized
+       every scroll/stream frame (a top cause of WebKitGTK jank on modest AMD
+       GPUs), but a plain alpha tint over the fixed wallpaper is just per-pixel
+       blending — the wallpaper glows through without any filter cost. */
+    background: var(--glass-bg-soft);
     border: 1px solid var(--glass-border);
     border-radius: var(--r-xl);
     overflow: hidden;
@@ -452,6 +508,18 @@ header {
     top: 0;
     z-index: 30;
     flex-shrink: 0;
+}
+
+/* Main chat header only (the bare `header` rule above also matches panel
+   headers living inside scroll containers — those must never get blur).
+   #app > header is a non-scrolling flex row above the chat scroller: its
+   backdrop (the #app tint + wallpaper strip behind it) is static, so this
+   blur never re-rasterizes during scroll/stream. */
+#app > header {
+    background: var(--glass-bg);
+    backdrop-filter: var(--glass-blur);
+    -webkit-backdrop-filter: var(--glass-blur);
+    box-shadow: var(--glass-shimmer);
 }
 
 .header-left {
@@ -823,10 +891,12 @@ header h1 {
     z-index: 200;
     min-width: 168px;
     padding: 4px;
-    background: var(--surface-2);
-    border: 1px solid var(--border);
+    /* Menus can open over a modal over glass chrome (3 deep): strong
+       opacity instead of blur, per the budget's stacking rule. */
+    background: var(--glass-bg-strong);
+    border: 1px solid var(--glass-border);
     border-radius: var(--r-md);
-    box-shadow: var(--shadow-menu);
+    box-shadow: var(--glass-shimmer), var(--shadow-menu);
     display: flex;
     flex-direction: column;
     gap: 1px;
@@ -1668,13 +1738,13 @@ header h1 {
     to   { opacity: 1; }
 }
 .rewind-dialog {
-    background: var(--surface-1);
-    border: 1px solid var(--border);
+    background: var(--glass-bg-strong);
+    border: 1px solid var(--glass-border);
     border-radius: var(--r-lg, 12px);
     padding: 24px;
     max-width: 400px;
     width: 90%;
-    box-shadow: var(--shadow-modal);
+    box-shadow: var(--glass-shimmer), var(--shadow-modal);
     animation: dialog-pop var(--dur) var(--ease);
 }
 @keyframes dialog-pop {
@@ -1818,9 +1888,9 @@ header h1 {
     margin: 6px 0;
     padding: 14px 16px;
     border-radius: var(--r-md);
+    /* Lives inside the chat scroller: translucent tint only, no blur —
+       a blur region here would re-rasterize on every scroll frame. */
     background: var(--glass-bg, rgba(19, 18, 18, 0.50));
-    -webkit-backdrop-filter: var(--glass-blur);
-    backdrop-filter: var(--glass-blur);
     border: 1px solid var(--glass-border, var(--border));
     box-shadow: var(--shadow-card);
     animation: dialog-pop var(--dur) var(--ease);
@@ -2084,9 +2154,8 @@ header h1 {
     margin: 6px 0;
     padding: 14px 16px;
     border-radius: var(--r-md);
+    /* In-scroller card (and itself a scroller): tint only, no blur. */
     background: var(--glass-bg, rgba(19, 18, 18, 0.50));
-    -webkit-backdrop-filter: var(--glass-blur);
-    backdrop-filter: var(--glass-blur);
     border: 1px solid var(--glass-border, var(--border));
     box-shadow: var(--shadow-card);
     animation: dialog-pop var(--dur) var(--ease);
@@ -3358,9 +3427,8 @@ mark.grep-match {
 .thinking-block {
     margin: 8px 0;
     padding: 0;
+    /* In-scroller block: tint only, no blur (chat scroller stays cheap). */
     background: var(--glass-bg);
-    backdrop-filter: var(--glass-blur);
-    -webkit-backdrop-filter: var(--glass-blur);
     border: 1px solid var(--glass-border);
     border-radius: var(--r-md);
     color: var(--text-2);
@@ -3773,7 +3841,9 @@ footer {
     right: 0;
     max-height: 200px;
     overflow-y: auto;
-    background: var(--glass-bg);
+    /* Floating over the static composer region only — its backdrop never
+       sits above another blur, so this blur stays within the stack budget. */
+    background: var(--glass-bg-strong);
     backdrop-filter: var(--glass-blur);
     -webkit-backdrop-filter: var(--glass-blur);
     border: 1px solid var(--glass-border);
@@ -3782,6 +3852,7 @@ footer {
     margin-bottom: 4px;
     z-index: 100;
     padding: 4px;
+    animation: arc-menu-in var(--dur-fast) var(--ease) both;
 }
 .slash-autocomplete.hidden { display: none; }
 .slash-ac-item {
@@ -5093,9 +5164,10 @@ option:hover {
 .grant-modal {
     width: 100%;
     max-width: 480px;
-    background: var(--surface-1);
+    background: var(--glass-bg-strong);
+    border: 1px solid var(--glass-border);
     border-radius: var(--r-lg);
-    box-shadow: var(--shadow-modal);
+    box-shadow: var(--glass-shimmer), var(--shadow-modal);
     overflow: hidden;
     animation: modal-in var(--dur-slow) var(--ease);
 }
@@ -5714,9 +5786,10 @@ option:hover {
     max-width: 520px;
     max-height: 88vh;
     overflow-y: auto;
-    background: var(--surface-1);
+    background: var(--glass-bg-strong);
+    border: 1px solid var(--glass-border);
     border-radius: var(--r-lg);
-    box-shadow: var(--shadow-modal);
+    box-shadow: var(--glass-shimmer), var(--shadow-modal);
     animation: modal-in var(--dur-slow) var(--ease);
 }
 
@@ -5854,13 +5927,13 @@ option:hover {
     padding: 0 10px 0 12px;
     margin-bottom: 14px;
     flex-shrink: 0;
+    /* Sits on the already-blurred .contacts-view shell — a second blur is
+       redundant (backdrop is uniform); tint + border reads identical. */
     background: var(--glass-bg);
-    backdrop-filter: var(--glass-blur);
-    -webkit-backdrop-filter: var(--glass-blur);
     border: 1px solid var(--glass-border);
     border-radius: var(--r-pill);
     box-shadow: var(--glass-shimmer);
-    transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
+    transition: border-color var(--dur) var(--ease);
 }
 .contacts-searchbar:focus-within {
     border-color: var(--brand-solid);
@@ -5940,9 +6013,9 @@ option:hover {
     font-weight: 700;
     letter-spacing: 0.06em;
     color: var(--brand-warm);
-    background: var(--glass-bg);
-    backdrop-filter: var(--glass-blur);
-    -webkit-backdrop-filter: var(--glass-blur);
+    /* Sticky inside the contacts scroller: strong-opacity tint, no blur —
+       blur here would re-rasterize on every scroll frame under the header. */
+    background: var(--glass-bg-strong);
     border-bottom: 1px solid var(--border);
 }
 .contact-section-header:first-child { margin-top: 0; }
@@ -6483,9 +6556,9 @@ option:hover {
     position: relative;
     min-width: 280px;
     max-width: 360px;
+    /* Toasts can land over a modal over glass chrome (3 deep): strong
+       opacity instead of blur keeps the stack within budget. */
     background: var(--glass-bg-strong);
-    backdrop-filter: var(--glass-blur);
-    -webkit-backdrop-filter: var(--glass-blur);
     border: 1px solid var(--glass-border);
     border-radius: var(--r-md);
     box-shadow: var(--shadow-raised);
@@ -7349,13 +7422,13 @@ option:hover {
 
 .tl-tooltip {
     position: fixed;
-    background: var(--surface-1);
-    border: 1px solid var(--border-strong);
+    background: var(--glass-bg-strong);
+    border: 1px solid var(--glass-border);
     border-radius: var(--r-sm);
     padding: 8px 10px;
     font-size: var(--fs-sm);
     color: var(--text);
-    box-shadow: var(--shadow-raised);
+    box-shadow: var(--glass-shimmer), var(--shadow-raised);
     z-index: 50;
     pointer-events: none;
     max-width: 280px;
@@ -7377,10 +7450,10 @@ option:hover {
 .onboarding-card {
     width: 100%;
     max-width: 480px;
-    background: var(--surface-1);
-    border: 1px solid var(--border-strong);
+    background: var(--glass-bg-strong);
+    border: 1px solid var(--glass-border);
     border-radius: var(--r-lg);
-    box-shadow: var(--shadow-modal);
+    box-shadow: var(--glass-shimmer), var(--shadow-modal);
     padding: 36px 32px 28px;
     animation: modal-in var(--dur-slow) var(--ease);
     max-height: 90vh;
@@ -7810,9 +7883,9 @@ option:hover {
 .profile-modal-overlay {
     position: fixed;
     inset: 0;
+    /* Plain dim like the other modal overlays — an overlay blur here can
+       cover view shell + changes rail and stack 3 blur regions deep. */
     background: rgba(0, 0, 0, 0.55);
-    backdrop-filter: var(--overlay-blur);
-    -webkit-backdrop-filter: var(--overlay-blur);
     display: grid;
     place-items: center;
     z-index: 220;
@@ -7826,9 +7899,10 @@ option:hover {
     max-height: 88vh;
     display: flex;
     flex-direction: column;
-    background: var(--surface-1);
+    background: var(--glass-bg-strong);
+    border: 1px solid var(--glass-border);
     border-radius: var(--r-lg);
-    box-shadow: var(--shadow-modal);
+    box-shadow: var(--glass-shimmer), var(--shadow-modal);
     overflow: hidden;
     animation: modal-in var(--dur-slow) var(--ease);
 }
@@ -10898,15 +10972,11 @@ option:hover {
     box-shadow: var(--glass-shimmer), 0 1px 0 rgba(255, 255, 255, 0.5);
 }
 
-/* Light-mode ambient gradient orbs — slightly stronger so frosted
-   white panels still show the colour washes through. */
-:root[data-theme="light"] body {
-    background:
-        radial-gradient(ellipse 60% 50% at 0% 0%, rgba(194, 88, 104, 0.22) 0%, transparent 70%),
-        radial-gradient(ellipse 50% 60% at 100% 100%, rgba(120, 80, 200, 0.16) 0%, transparent 70%),
-        radial-gradient(ellipse 40% 50% at 100% 0%, rgba(215, 132, 113, 0.15) 0%, transparent 60%),
-        radial-gradient(ellipse 35% 40% at 50% 100%, rgba(160, 80, 180, 0.12) 0%, transparent 60%),
-        var(--bg-deep);
+/* Higher specificity than the #app > header glass rule, so the light theme
+   keeps the brighter macOS-light hairline highlight on the chat header. */
+:root[data-theme="light"] #app > header,
+:root[data-theme="light"] #titlebar {
+    box-shadow: var(--glass-shimmer), 0 1px 0 rgba(255, 255, 255, 0.5);
 }
 
 /* ── Composer action menu (three-dot) ── */
@@ -10955,10 +11025,11 @@ option:hover {
 }
 .goal-modal-overlay.hidden { display: none; }
 .goal-modal {
-    background: var(--surface-1);
+    background: var(--glass-bg-strong);
+    border: 1px solid var(--glass-border);
     border-radius: var(--r-xl);
     width: 90vw; max-width: 480px;
-    box-shadow: var(--shadow-modal);
+    box-shadow: var(--glass-shimmer), var(--shadow-modal);
     animation: modal-in var(--dur-slow) var(--ease);
 }
 .goal-modal-header {
@@ -11769,9 +11840,8 @@ option:hover {
     z-index: 10000;
     max-width: 320px;
     padding: 5px 10px;
+    /* Tooltips ride above every layer (z 10000): strong opacity, no blur. */
     background: var(--glass-bg-strong);
-    -webkit-backdrop-filter: var(--glass-blur);
-    backdrop-filter: var(--glass-blur);
     border: 1px solid var(--glass-border);
     border-radius: var(--r-xs);
     box-shadow: var(--shadow-raised);
