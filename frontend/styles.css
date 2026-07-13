@@ -85,6 +85,11 @@
     --sidebar-w: 240px;
     --header-h:  52px;
     --content-max: 1060px;
+    /* Live composer height — kept in sync with the real footer height by a
+       ResizeObserver in app.js; only read at the rich tier, where the composer
+       overlays the scroll surface and the chat needs matching bottom padding.
+       Static fallback for the pre-measure first frame. */
+    --composer-h: 88px;
 
     /* overlays — used for hover/active backgrounds, theme-aware */
     --overlay-hover:  rgba(255, 255, 255, 0.08);
@@ -12063,3 +12068,149 @@ option:hover {
 }
 
 .label-optional { opacity: 0.5; }
+
+
+/* ═══════════════════════════════════════════════════════════════════════
+   Dynamic motion — general dynamism (GOAL parts B, C, D)
+   ───────────────────────────────────────────────────────────────────────
+   All effects here are compositor-only (opacity / transform / static
+   mask-image) and gated to :root[data-glass="balanced"|"rich"]. lite is
+   never given a new effect, so it stays byte-for-byte today's static
+   behavior. No backdrop-filter is introduced; no layout property
+   (width/height/top/left/margin/padding) is animated or transitioned.
+   The global prefers-reduced-motion rule (top of file) already collapses
+   every transition/animation to ~0ms; the extra guard below additionally
+   forces reveal targets fully visible so nothing is ever left hidden.
+   ══════════════════════════════════════════════════════════════════════ */
+
+/* ── B. Scroll-reveal entrances ──────────────────────────────────────────
+   app.js drives a single shared IntersectionObserver that tags newly
+   inserted message rows / in-thread tool groups with .will-reveal, then
+   .revealed when they enter the viewport. Hidden state applies only at
+   balanced/rich (JS also refuses to attach at lite), so the class is inert
+   anywhere it shouldn't fire. */
+:root[data-glass="balanced"] .will-reveal,
+:root[data-glass="rich"] .will-reveal {
+    opacity: 0;
+    transform: translateY(10px);
+    transition: opacity var(--dur-slow) var(--ease),
+                transform var(--dur-slow) var(--ease);
+}
+:root[data-glass="balanced"] .will-reveal.revealed,
+:root[data-glass="rich"] .will-reveal.revealed {
+    opacity: 1;
+    transform: none;
+}
+/* Never leave a reveal target invisible when motion is reduced (or if a tier
+   override is pinned under reduced-motion): render it immediately visible. */
+@media (prefers-reduced-motion: reduce) {
+    .will-reveal { opacity: 1 !important; transform: none !important; }
+}
+
+/* ── C. Edge-fade masks ──────────────────────────────────────────────────
+   Soften where the scrolling messages meet the chrome bars: a static
+   mask-image gradient fades the top/bottom edges of the scroll container.
+   A mask is a cheap GPU compositing op — NOT a backdrop-filter — and it
+   lives on the scroll pane only, which is allowed. */
+:root[data-glass="balanced"] #chat-container,
+:root[data-glass="rich"] #chat-container {
+    -webkit-mask-image: linear-gradient(to bottom,
+        transparent 0, #000 28px,
+        #000 calc(100% - 20px), transparent 100%);
+    mask-image: linear-gradient(to bottom,
+        transparent 0, #000 28px,
+        #000 calc(100% - 20px), transparent 100%);
+}
+
+/* ── D. Tactile micro-interactions ───────────────────────────────────────
+   Press-spring and hover-lift using existing motion tokens. Transform-only;
+   the transitions below re-declare the element's existing transition and
+   append `transform` so the base rules keep their background/color easing. */
+
+/* Press spring — a subtle scale-down on :active, springs back on release. */
+:root[data-glass="balanced"] #send-btn,
+:root[data-glass="rich"] #send-btn,
+:root[data-glass="balanced"] #new-chat-btn,
+:root[data-glass="rich"] #new-chat-btn,
+:root[data-glass="balanced"] .welcome-chip,
+:root[data-glass="rich"] .welcome-chip {
+    transition: background var(--dur) var(--ease),
+                border-color var(--dur) var(--ease),
+                color var(--dur) var(--ease),
+                box-shadow var(--dur) var(--ease),
+                transform var(--dur-fast) var(--ease);
+}
+:root[data-glass="balanced"] #send-btn:active,
+:root[data-glass="rich"] #send-btn:active,
+:root[data-glass="balanced"] #new-chat-btn:active,
+:root[data-glass="rich"] #new-chat-btn:active,
+:root[data-glass="balanced"] .welcome-chip:active,
+:root[data-glass="rich"] .welcome-chip:active {
+    transform: scale(0.97);
+}
+
+/* Hover lift — session items rise a hair on hover. The base .session-item
+   transition only eases background/color, so re-declare it here with
+   transform appended (still compositor-only). */
+:root[data-glass="balanced"] .session-item,
+:root[data-glass="rich"] .session-item {
+    transition: background var(--dur) var(--ease),
+                color var(--dur) var(--ease),
+                transform var(--dur-fast) var(--ease);
+}
+:root[data-glass="balanced"] .session-item:hover,
+:root[data-glass="rich"] .session-item:hover {
+    transform: translateY(-1px);
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════
+   Dynamic motion — scroll-repaint glass (GOAL part A · rich tier ONLY)
+   ───────────────────────────────────────────────────────────────────────
+   At the rich tier the two bounded chrome bars are lifted out of the flex
+   flow to OVERLAY the top/bottom of the chat scroller, so the messages scroll
+   *behind* them. Their live backdrop-filter then re-blurs the moving content
+   as it passes under — the Apple "Liquid Glass" scroll-repaint. Repaint stays
+   bounded to the bar heights (never the scroll pane, per the perf guardrail).
+
+   balanced / lite are untouched: the header keeps its in-flow `position:
+   sticky`, the footer stays in normal flow, and #chat-container keeps its base
+   padding — so those tiers are byte-for-byte today's static layout. No
+   property here is animated or transitioned (paddings are static; the
+   backdrop-filter repaints from scroll, not from a CSS transition).
+   ══════════════════════════════════════════════════════════════════════ */
+
+/* Header: overlay the top of the scroller. It already carries a paired
+   backdrop-filter (base `#app > header` rule); at rich, --glass-blur is the
+   deeper live blur and the content beneath now moves, so it repaints live. */
+:root[data-glass="rich"] #app > header {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 30;
+}
+
+/* Composer footer: overlay the bottom of the scroller + its own live blur.
+   A top-fading gradient scrim (transparent → glass tint) lets messages
+   dissolve up into the bar instead of hard-clipping at its edge; the
+   backdrop-filter frosts whatever shows through. Paired -webkit- sibling. */
+:root[data-glass="rich"] #app > footer {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 5;
+    background: linear-gradient(to top, var(--glass-bg) 55%, transparent 100%);
+    backdrop-filter: var(--glass-blur);
+    -webkit-backdrop-filter: var(--glass-blur);
+    box-shadow: var(--glass-shimmer);
+}
+
+/* Make room so the overlaid bars never cover the first/last message: grow the
+   scroll content by each bar's height. --composer-h tracks the live composer
+   height (ResizeObserver in app.js). Static paddings — never transitioned. */
+:root[data-glass="rich"] #chat-container {
+    padding-top: calc(32px + var(--header-h));
+    padding-bottom: calc(16px + var(--composer-h));
+}

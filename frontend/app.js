@@ -143,6 +143,115 @@ function scheduleIdle(fn) {
     }
 }
 
+// ─── Scroll-reveal (single shared IntersectionObserver) ───
+// Fades + lifts message rows and in-thread tool groups as they enter the
+// viewport. The effect is compositor-only (opacity + transform — CSS owns the
+// transition) and is enabled ONLY when IntersectionObserver exists AND the
+// glass tier is not "lite", so lite / reduced-motion (which the probe forces to
+// lite) stay byte-for-byte static and nothing is ever left hidden. One shared
+// observer + one MutationObserver on #messages — never a per-element observer,
+// never a scroll listener.
+let revealObserver = null;
+
+function revealEnabled() {
+    return typeof IntersectionObserver === 'function' &&
+        document.documentElement.dataset.glass !== 'lite';
+}
+
+function ensureRevealObserver() {
+    if (revealObserver || !revealEnabled()) return revealObserver;
+    revealObserver = new IntersectionObserver((entries) => {
+        for (const entry of entries) {
+            if (!entry.isIntersecting) continue;
+            entry.target.classList.add('revealed');
+            revealObserver.unobserve(entry.target); // reveal once; no leak
+        }
+    }, { root: null, rootMargin: '0px 0px -6% 0px', threshold: 0.01 });
+    return revealObserver;
+}
+
+// Attach reveal to one freshly inserted element. Callers pass a viewport height
+// measured once per insert burst so we never read layout per element in a loop.
+function attachReveal(el, viewportH) {
+    const obs = ensureRevealObserver();
+    if (!obs) return; // lite / no IO → leave the element fully visible, untouched
+    const rect = el.getBoundingClientRect();
+    // Already within/above the viewport → reveal synchronously. Adding both
+    // classes at once means no starting-from-hidden transition (so no flash and
+    // no competition with the msg-in insert animation); the element just stays
+    // visible while its own insert animation, if any, plays.
+    if (rect.top < viewportH && rect.bottom > 0) {
+        el.classList.add('will-reveal', 'revealed');
+        return;
+    }
+    el.classList.add('will-reveal');
+    obs.observe(el);
+}
+
+// Top-level reveal-eligible items inside #messages: message rows and the
+// live/history tool groups. Kept narrow so nested fragments aren't hidden.
+const REVEAL_SELECTOR = '.message-row, .tool-group-history';
+
+function initScrollReveal() {
+    if (!revealEnabled()) return;
+    const messages = document.getElementById('messages');
+    if (!messages) return;
+    const mo = new MutationObserver((mutations) => {
+        const fresh = [];
+        for (const m of mutations) {
+            for (const node of m.addedNodes) {
+                if (node.nodeType === 1 && node.matches &&
+                    node.matches(REVEAL_SELECTOR)) {
+                    fresh.push(node);
+                }
+            }
+        }
+        if (!fresh.length) return;
+        // Batch all geometry reads into one frame — a single reflow for the
+        // whole insert burst instead of one per node (no read/write thrash).
+        requestAnimationFrame(() => {
+            const vh = window.innerHeight || document.documentElement.clientHeight;
+            for (const el of fresh) attachReveal(el, vh);
+        });
+    });
+    mo.observe(messages, { childList: true });
+}
+
+// ─── Composer-height var (feeds GOAL part A scroll-repaint glass) ───
+// At the rich tier the composer <footer> overlays the bottom of the chat
+// scroller (CSS), so #chat-container needs bottom padding equal to the live
+// composer height to keep the last message clear of the bar. The composer
+// grows/shrinks (attachments, multi-line input), so a single ResizeObserver
+// keeps `--composer-h` in sync. The var is read by CSS only at rich, but we
+// always keep it fresh so a runtime setGlassTier('rich') is correct instantly.
+// When the user is pinned to the bottom, a padding change would otherwise
+// un-pin them (scrollHeight jumps), so we snapshot the pin BEFORE writing the
+// var and re-anchor to the bottom after — no scrollTop-retention regression.
+function initComposerHeightVar() {
+    const footer = document.querySelector('#app > footer');
+    if (!footer) return;
+    const scroller = document.getElementById('chat-container');
+    const update = () => {
+        const wasPinned = scroller ? isScrollPinned(scroller) : false;
+        document.documentElement.style.setProperty(
+            '--composer-h', footer.offsetHeight + 'px');
+        if (wasPinned && scroller) {
+            // Re-anchor after the padding-driven reflow settles.
+            requestAnimationFrame(() => {
+                scroller.scrollTop = scroller.scrollHeight;
+            });
+        }
+    };
+    if (typeof ResizeObserver === 'function') {
+        // Observing the footer only — writing --composer-h resizes
+        // #chat-container's padding, never the footer, so no observer loop.
+        new ResizeObserver(update).observe(footer);
+    } else {
+        window.addEventListener('resize', update, { passive: true });
+    }
+    update(); // seed before first paint settles
+}
+
 // ─── Built-in tool icons ───
 // Maps Athen built-in tool names to inline SVG markup so the chat UI can
 // show an icon + short label instead of the raw tool identifier. Tools not
@@ -22462,4 +22571,6 @@ wireVoicePanel();
 wireMcpServersPanel();
 wireActiveAgentsPanel();
 wireCalendarSourcesPanel();
+initScrollReveal();
+initComposerHeightVar();
 initTauri();
