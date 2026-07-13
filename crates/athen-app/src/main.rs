@@ -20,14 +20,30 @@ fn main() {
     #[cfg(target_os = "linux")]
     glib::set_prgname(Some("com.athen.app"));
 
-    // WORKAROUND: WebKitGTK 2.44+ DMABUF renderer + Mesa/RADV (AMD) stalls GPU
-    // command submission, causing system-wide compositor stutter (visible even
-    // when Athen is unfocused). Forcing the older GLX path avoids it. Confirmed
-    // on Fedora 44 + AMD iGPU, 2026-05-03. Revisit when WebKitGTK or Mesa ship
-    // a fix; on Intel/NVIDIA this just costs a small amount of perf.
-    // Must be set before Tauri/WebKitGTK initializes.
+    // WebKitGTK's DMABUF renderer is the fast, zero-copy GPU compositing path —
+    // and the blur/backdrop-filter-heavy glass UI leans on it hard. We keep it
+    // ON by default.
+    //
+    // HISTORY: WebKitGTK 2.44 introduced a DMABUF-renderer + Mesa/RADV (AMD)
+    // regression that stalled GPU command submission, causing system-wide
+    // compositor stutter even when Athen was unfocused (Fedora 44 + AMD iGPU,
+    // 2026-05-03). We worked around it by forcing the old GLX path. Upstream has
+    // since hardened the renderer (fixes across WebKitGTK 2.46–2.50); verified
+    // smooth AND stutter-free on AMD 890M / WebKitGTK 2.52 / Mesa 26, where
+    // disabling DMABUF was pure cost (janked the glass UI). So the workaround is
+    // now opt-IN: legacy stacks still hitting the stall can force the GLX path
+    // with `ATHEN_DISABLE_DMABUF=1`. An explicit WEBKIT_DISABLE_DMABUF_RENDERER
+    // in the environment is always respected. Must be decided before
+    // Tauri/WebKitGTK initializes.
     #[cfg(target_os = "linux")]
-    std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    {
+        let disable_dmabuf = std::env::var("ATHEN_DISABLE_DMABUF")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if disable_dmabuf && std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
+            std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+        }
+    }
 
     // Cap tokio worker threads. Tauri's default global runtime spawns one
     // worker per CPU core, but Athen's workload is overwhelmingly I/O-bound
