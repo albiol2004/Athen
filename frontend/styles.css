@@ -105,6 +105,11 @@
        large content panes (#app) that must stay blur-free but should let the
        static wallpaper glow through. Alpha compositing only; cheap. */
     --glass-bg-soft: rgba(19, 18, 18, 0.86);
+    /* Frosted variant for #app: paired WITH a backdrop-filter (balanced/rich
+       only) so the fixed wallpaper gradient shows through blurred. Lower alpha
+       than --glass-bg-soft — the blur, not the tint, provides legibility, but
+       kept high enough that chat text stays readable over the busy gradient. */
+    --glass-bg-app-frost: rgba(19, 18, 18, 0.60);
     --glass-blur:    blur(16px) saturate(1.4);
     --overlay-blur:  blur(4px);
     --glass-border:  rgba(255, 255, 255, 0.06);
@@ -192,6 +197,7 @@
     --glass-bg:      rgba(255, 255, 255, 0.55);
     --glass-bg-strong: rgba(255, 255, 255, 0.95);
     --glass-bg-soft: rgba(255, 255, 255, 0.82);
+    --glass-bg-app-frost: rgba(255, 255, 255, 0.60);
     --glass-blur:    blur(24px) saturate(1.6);
     --overlay-blur:  blur(4px);
     --glass-border:  rgba(0, 0, 0, 0.06);
@@ -561,6 +567,20 @@ a:hover { color: var(--brand-warm); }
     position: relative;
 }
 
+/* Frosted #app (balanced/rich only): now that the DMABUF GPU path is on by
+   default, #app gets a real backdrop-filter so the FIXED body::before
+   wallpaper gradient shows through frosted. The blur samples only the static
+   wallpaper behind #app (never the scrolling message content, which lives
+   INSIDE #app), so it rasterizes once — cheap on the DMABUF path. The tint
+   alpha drops to the frost token so the gradient is visible while text stays
+   legible. lite keeps the opaque --glass-bg-soft with no filter (the floor). */
+:root[data-glass="balanced"] #app,
+:root[data-glass="rich"] #app {
+    background: var(--glass-bg-app-frost);
+    backdrop-filter: var(--glass-blur);
+    -webkit-backdrop-filter: var(--glass-blur);
+}
+
 /* ─── Header ─── */
 header {
     height: var(--header-h);
@@ -691,6 +711,86 @@ header h1 {
     background: var(--surface-2);
     color: var(--text);
 }
+
+/* ─── Custom top-bar dropdowns (Part C) ─── */
+/* The native <select> is kept in the DOM as the state owner but visually
+   removed once enhanced — its OS-rendered popup is what we're replacing. */
+.enhanced-select-native {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    clip-path: inset(50%);
+    border: 0;
+    pointer-events: none;
+}
+.select-trigger {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    height: 26px;
+    max-width: 180px;
+    padding: 0 6px 0 4px;
+    background: transparent;
+    color: var(--text);
+    border: 0;
+    border-radius: var(--r-sm);
+    font-size: var(--fs-sm);
+    font-weight: 500;
+    cursor: pointer;
+    outline: none;
+    transition: background var(--dur) var(--ease);
+}
+.select-trigger:hover:not(:disabled) { background: var(--overlay-hover); }
+.select-trigger:disabled { opacity: 0.6; cursor: not-allowed; }
+.select-trigger-label {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.select-trigger-chevron {
+    display: inline-grid;
+    place-items: center;
+    color: var(--text-3);
+    flex-shrink: 0;
+    transition: transform var(--dur) var(--ease), color var(--dur) var(--ease);
+}
+.select-trigger:hover:not(:disabled) .select-trigger-chevron { color: var(--text); }
+.select-trigger.open .select-trigger-chevron { transform: rotate(180deg); }
+
+/* Custom glass listbox — same stacking-safe strong tint as .arc-menu. */
+.select-popup {
+    position: fixed;
+    z-index: 200;
+    min-width: 140px;
+    max-height: 320px;
+    overflow-y: auto;
+    padding: 4px;
+    background: var(--glass-bg-strong);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--r-md);
+    box-shadow: var(--glass-shimmer), var(--shadow-menu);
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    animation: arc-menu-in var(--dur-fast) var(--ease) both;
+}
+.select-option {
+    padding: 6px 10px;
+    border-radius: var(--r-sm);
+    color: var(--text);
+    font-size: var(--fs-md);
+    white-space: nowrap;
+    cursor: pointer;
+    transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
+}
+.select-option.active { background: var(--overlay-hover); }
+.select-option.selected { color: var(--brand-solid); font-weight: 600; }
 
 /* ─── Sidebar ─── */
 .sidebar {

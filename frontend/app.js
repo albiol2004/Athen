@@ -994,10 +994,27 @@ function registerTauriEventListeners() {
     });
 }
 
+// Open a URL in the system browser. The opener plugin's JS global
+// (`window.__TAURI__.opener`) is NOT reliably injected even under
+// `withGlobalTauri:true`, so we prefer it when present but fall back to the
+// always-available core `invoke` calling the plugin's command directly
+// (`plugin:opener|open_url`, capability `opener:allow-open-url` is granted).
+// Returns a Promise; callers should `.catch` since the opener may be absent.
+function openExternalUrl(href) {
+    const t = window.__TAURI__;
+    if (t && t.opener && typeof t.opener.openUrl === 'function') {
+        return t.opener.openUrl(href);
+    }
+    if (t && t.core && typeof t.core.invoke === 'function') {
+        return t.core.invoke('plugin:opener|open_url', { url: href });
+    }
+    return Promise.reject(new Error('no opener available'));
+}
+
 // Route `<a target="_blank">` and any external http(s) anchor through the
-// Tauri opener plugin so clicks actually reach the system browser. The
-// WebView doesn't honor `target="_blank"` for navigation, so without this
-// every external-link click is a silent no-op.
+// Tauri opener so clicks actually reach the system browser. The WebView
+// doesn't honor `target="_blank"` for navigation, so without this every
+// external-link click is a silent no-op.
 function installExternalLinkOpener() {
     document.addEventListener('click', (e) => {
         const a = e.target.closest('a');
@@ -1005,12 +1022,7 @@ function installExternalLinkOpener() {
         const href = a.getAttribute('href') || '';
         if (!/^https?:\/\//i.test(href)) return;
         e.preventDefault();
-        const opener = window.__TAURI__ && window.__TAURI__.opener;
-        if (opener && opener.openUrl) {
-            opener.openUrl(href).catch((err) => console.warn('openUrl failed:', err));
-        } else {
-            console.warn('opener plugin unavailable; cannot open', href);
-        }
+        openExternalUrl(href).catch((err) => console.warn('openUrl failed:', err));
     });
 }
 
@@ -1246,6 +1258,7 @@ function renderProfilePicker() {
     if (!agentProfiles || agentProfiles.length === 0) {
         sel.innerHTML = '<option value="default">Default</option>';
         sel.disabled = true;
+        if (sel._athenSync) sel._athenSync();
         return;
     }
     sel.disabled = !activeArcId;
@@ -1256,6 +1269,7 @@ function renderProfilePicker() {
         return `<option value="${escapeHtml(p.id)}"${selected}>${escapeHtml(p.display_name)}</option>`;
     });
     sel.innerHTML = opts.join('');
+    if (sel._athenSync) sel._athenSync();
 }
 
 async function onProfileChange(ev) {
@@ -1284,6 +1298,7 @@ function renderReasoningPicker() {
     sel.disabled = !activeArcId;
     const meta = activeArcId ? arcMetaById.get(activeArcId) : null;
     sel.value = (meta && meta.reasoning_effort_override) || 'default';
+    if (sel._athenSync) sel._athenSync();
 }
 
 async function onReasoningChange(ev) {
@@ -1309,6 +1324,7 @@ function renderTierPicker() {
     // tier so an arc pinned before the rename still selects the right option.
     const stored = (meta && meta.tier_override) || 'auto';
     sel.value = stored === 'Cheap' ? 'Judges' : stored;
+    if (sel._athenSync) sel._athenSync();
 }
 
 async function onTierChange(ev) {
@@ -1333,6 +1349,7 @@ function renderSecurityPicker() {
     const meta = activeArcId ? arcMetaById.get(activeArcId) : null;
     // 'global' is the cleared-override sentinel (no per-arc override).
     sel.value = (meta && meta.security_mode_override) || 'global';
+    if (sel._athenSync) sel._athenSync();
 }
 
 async function onSecurityChange(ev) {
@@ -3240,7 +3257,13 @@ function renderAttachmentChips(attachments) {
             img.alt = att.name || 'image';
             img.dataset.tip = att.name || '';
             img.addEventListener('click', () => {
-                window.open(att.data_url, '_blank');
+                // http(s) thumbnails open in the browser via the opener; a
+                // data:/asset: URL the opener can't take degrades gracefully
+                // (the WebView ignored window.open here anyway).
+                const url = att.data_url || '';
+                if (/^https?:\/\//i.test(url)) {
+                    openExternalUrl(url).catch((err) => console.warn('openUrl failed:', err));
+                }
             });
             row.appendChild(img);
         } else {
@@ -8575,6 +8598,177 @@ const arcSecurityPicker = document.getElementById('arc-security-picker');
 if (arcSecurityPicker) {
     arcSecurityPicker.addEventListener('change', onSecurityChange);
 }
+
+// ── Custom top-bar dropdowns (Part C) ──
+// Native <select> popups are OS-rendered in WebKitGTK and can't be styled.
+// enhanceSelect() keeps each <select> as the hidden state owner and renders a
+// glass trigger + custom listbox popup. Selecting sets select.value and
+// dispatches a synthetic 'change' so ALL existing wiring fires unchanged; a
+// `_athenSync` on the select (called from each render*Picker) plus a childList
+// MutationObserver keep the trigger label in step with programmatic updates.
+let openSelectDropdown = null; // { el, close } of the open custom popup, if any
+
+function enhanceSelect(sel) {
+    if (!sel || sel._athenEnhanced) return;
+    sel._athenEnhanced = true;
+    sel.classList.add('enhanced-select-native');
+    sel.setAttribute('aria-hidden', 'true');
+    sel.tabIndex = -1;
+
+    const trigger = document.createElement('button');
+    trigger.type = 'button';
+    trigger.className = 'select-trigger';
+    trigger.setAttribute('aria-haspopup', 'listbox');
+    trigger.setAttribute('aria-expanded', 'false');
+    if (sel.id) trigger.setAttribute('aria-label', sel.id.replace(/^arc-|-picker$/g, ''));
+    const labelSpan = document.createElement('span');
+    labelSpan.className = 'select-trigger-label';
+    const chevron = document.createElement('span');
+    chevron.className = 'select-trigger-chevron';
+    chevron.setAttribute('aria-hidden', 'true');
+    chevron.innerHTML = '<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>';
+    trigger.appendChild(labelSpan);
+    trigger.appendChild(chevron);
+    sel.insertAdjacentElement('afterend', trigger);
+
+    let popup = null;
+    let activeIndex = -1;
+    let cleanup = null;
+
+    const sync = () => {
+        const opt = sel.options[sel.selectedIndex];
+        labelSpan.textContent = opt ? opt.textContent : '';
+        trigger.disabled = sel.disabled;
+        trigger.setAttribute('aria-disabled', sel.disabled ? 'true' : 'false');
+    };
+    sel._athenSync = sync;
+    sync();
+
+    // Repopulation (e.g. the profile list filled after load) updates the label.
+    new MutationObserver(sync).observe(sel, { childList: true });
+
+    function setActive(i) {
+        if (!popup) return;
+        const items = popup.children;
+        if (i < 0 || i >= items.length) return;
+        if (activeIndex >= 0 && items[activeIndex]) items[activeIndex].classList.remove('active');
+        activeIndex = i;
+        items[i].classList.add('active');
+        items[i].scrollIntoView({ block: 'nearest' });
+    }
+
+    function choose(i) {
+        if (i < 0 || i >= sel.options.length) return;
+        if (sel.selectedIndex !== i) {
+            sel.selectedIndex = i;
+            sel.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+        sync();
+        closePopup(true);
+    }
+
+    function positionPopup() {
+        const r = trigger.getBoundingClientRect();
+        popup.style.minWidth = `${Math.round(r.width)}px`;
+        const pw = popup.offsetWidth;
+        const ph = popup.offsetHeight;
+        let left = r.left;
+        if (left + pw > window.innerWidth - 8) left = window.innerWidth - pw - 8;
+        if (left < 8) left = 8;
+        let top = r.bottom + 4;
+        if (top + ph > window.innerHeight - 8) top = r.top - ph - 4;
+        if (top < 8) top = 8;
+        popup.style.left = `${Math.round(left)}px`;
+        popup.style.top = `${Math.round(top)}px`;
+    }
+
+    function closePopup(returnFocus) {
+        if (!popup) return;
+        if (cleanup) { cleanup(); cleanup = null; }
+        popup.remove();
+        popup = null;
+        activeIndex = -1;
+        trigger.setAttribute('aria-expanded', 'false');
+        trigger.classList.remove('open');
+        if (openSelectDropdown && openSelectDropdown.el === trigger) openSelectDropdown = null;
+        if (returnFocus) trigger.focus();
+    }
+
+    function openPopup() {
+        if (popup || sel.disabled) return;
+        if (openSelectDropdown) openSelectDropdown.close(false);
+        popup = document.createElement('div');
+        popup.className = 'select-popup';
+        popup.setAttribute('role', 'listbox');
+        Array.from(sel.options).forEach((o, i) => {
+            const item = document.createElement('div');
+            item.className = 'select-option';
+            item.setAttribute('role', 'option');
+            item.textContent = o.textContent;
+            const isSel = i === sel.selectedIndex;
+            item.setAttribute('aria-selected', isSel ? 'true' : 'false');
+            if (isSel) item.classList.add('selected');
+            item.addEventListener('click', () => choose(i));
+            item.addEventListener('mousemove', () => setActive(i));
+            popup.appendChild(item);
+        });
+        document.body.appendChild(popup);
+        positionPopup();
+        trigger.setAttribute('aria-expanded', 'true');
+        trigger.classList.add('open');
+        setActive(sel.selectedIndex >= 0 ? sel.selectedIndex : 0);
+
+        const onDocClick = (e) => {
+            if (popup && !popup.contains(e.target) && !trigger.contains(e.target)) closePopup(false);
+        };
+        const onWinChange = () => closePopup(false);
+        setTimeout(() => document.addEventListener('click', onDocClick, true), 0);
+        window.addEventListener('resize', onWinChange);
+        window.addEventListener('scroll', onWinChange, true);
+        const overlayHandle = pushOverlay(() => closePopup(true));
+        cleanup = () => {
+            document.removeEventListener('click', onDocClick, true);
+            window.removeEventListener('resize', onWinChange);
+            window.removeEventListener('scroll', onWinChange, true);
+            removeOverlay(overlayHandle);
+        };
+        openSelectDropdown = { el: trigger, close: closePopup };
+    }
+
+    trigger.addEventListener('click', () => {
+        if (popup) closePopup(true); else openPopup();
+    });
+    trigger.addEventListener('keydown', (e) => {
+        if (e.isComposing || sel.disabled) return;
+        if (!popup) {
+            if (e.key === 'Enter' || e.key === ' ' || e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+                e.preventDefault();
+                openPopup();
+            }
+            return;
+        }
+        switch (e.key) {
+            case 'ArrowDown': e.preventDefault(); setActive(Math.min(activeIndex + 1, popup.children.length - 1)); break;
+            case 'ArrowUp': e.preventDefault(); setActive(Math.max(activeIndex - 1, 0)); break;
+            case 'Home': e.preventDefault(); setActive(0); break;
+            case 'End': e.preventDefault(); setActive(popup.children.length - 1); break;
+            case 'Enter':
+            case ' ': e.preventDefault(); choose(activeIndex); break;
+            case 'Escape': e.preventDefault(); closePopup(true); break;
+            case 'Tab': closePopup(false); break;
+            default: break;
+        }
+    });
+}
+
+function enhanceHeaderSelects() {
+    ['arc-profile-picker', 'arc-reasoning-picker', 'arc-tier-picker', 'arc-security-picker']
+        .forEach((id) => {
+            const el = document.getElementById(id);
+            if (el) enhanceSelect(el);
+        });
+}
+enhanceHeaderSelects();
 
 const newProfileBtn = document.getElementById('new-profile-btn');
 if (newProfileBtn) {
