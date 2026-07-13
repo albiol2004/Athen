@@ -84,6 +84,55 @@ function applyTheme(theme) {
     } catch (_) {}
 })();
 
+// ─── Glass tier (Liquid Glass hardware/perf gating) ───
+// Drives :root[data-glass] = "lite" | "balanced" | "rich". CSS scales visual
+// richness to the machine: lite = today's cheap floor (tints only, no
+// backdrop-filter on scrolling surfaces), balanced = + static specular edge &
+// refined depth (zero per-frame cost), rich = + deeper live blur on the
+// already-static glass surfaces and a subtle animated sheen.
+const GLASS_STORAGE_KEY = 'athen-glass';
+const GLASS_TIERS = ['lite', 'balanced', 'rich'];
+
+function applyGlassTier(tier) {
+    if (!GLASS_TIERS.includes(tier)) tier = 'balanced';
+    // Plain string assignment — no layout/paint work at boot.
+    document.documentElement.dataset.glass = tier;
+}
+
+// Persist a manual override; it wins over the probe on every subsequent boot.
+// This is the reachable-from-JS hook a settings surface (or the console) uses.
+function setGlassTier(tier) {
+    if (!GLASS_TIERS.includes(tier)) return;
+    applyGlassTier(tier);
+    try { localStorage.setItem(GLASS_STORAGE_KEY, tier); } catch (_) {}
+}
+
+// Cheap capability probe: reduced-motion forces lite; otherwise a coarse
+// CPU/RAM heuristic picks balanced vs rich. deviceMemory is absent on many
+// engines (incl. WebKitGTK) — default it so the CPU signal still decides.
+function probeGlassTier() {
+    try {
+        if (window.matchMedia &&
+            window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+            return 'lite';
+        }
+    } catch (_) {}
+    const cores = navigator.hardwareConcurrency || 4;
+    const mem = navigator.deviceMemory || 4; // GiB
+    if (cores >= 8 && mem >= 8) return 'rich';
+    if (cores >= 4 && mem >= 4) return 'balanced';
+    return 'lite';
+}
+
+// Apply immediately (before first paint) so CSS keys off the tier with no flash.
+(function initGlassTier() {
+    let saved = null;
+    try { saved = localStorage.getItem(GLASS_STORAGE_KEY); } catch (_) {}
+    applyGlassTier(GLASS_TIERS.includes(saved) ? saved : probeGlassTier());
+})();
+// Expose the tier hook so a settings surface / console can pin a tier.
+window.setGlassTier = setGlassTier;
+
 // Schedule a non-critical callback for an idle slice, with a setTimeout
 // fallback for environments lacking requestIdleCallback (older WebKitGTK).
 function scheduleIdle(fn) {

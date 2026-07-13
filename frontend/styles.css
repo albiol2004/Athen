@@ -105,6 +105,26 @@
     --glass-border:  rgba(255, 255, 255, 0.06);
     --glass-shimmer: rgba(255, 255, 255, 0.04) 0px 1px 0px 0px inset;
 
+    /* Liquid Glass (tiered — see the [data-glass] block below the light theme).
+       These are the RICH/BALANCED ingredients; the base tokens above stay the
+       lite floor. Deeper live blur, read only by proven-static glass regions. */
+    --glass-blur-rich: blur(30px) saturate(1.8);
+    /* Specular edge: bright top/left inner sheen + darker bottom/right so a
+       panel reads as a lens catching light. Pure inset box-shadows — static,
+       GPU-cheap. Swapped into --glass-shimmer under balanced/rich. */
+    --glass-specular:
+        rgba(255, 255, 255, 0.10) 0px 1px 0px 0px inset,
+        rgba(255, 255, 255, 0.06) 1px 0px 0px 0px inset,
+        rgba(0, 0, 0, 0.22) 0px -1px 0px 0px inset,
+        rgba(0, 0, 0, 0.14) -1px 0px 0px 0px inset;
+    /* Depth hierarchy for stacked glass (chrome < menu < modal). --elevate-3
+       keeps the modal's crisp hairline ring. */
+    --elevate-2: 0 10px 30px rgba(0, 0, 0, 0.42), 0 2px 8px rgba(0, 0, 0, 0.30);
+    --elevate-3:
+        0 18px 56px -8px rgba(0, 0, 0, 0.62),
+        0 4px 16px rgba(0, 0, 0, 0.40),
+        0 0 0 1px var(--border-strong);
+
     /* wallpaper — the fixed ambient layer behind everything (body::before).
        Static by contract: never animated, never repainted after first paint. */
     --wallpaper:
@@ -172,6 +192,20 @@
     --glass-border:  rgba(0, 0, 0, 0.06);
     --glass-shimmer: rgba(255, 255, 255, 0.9) 0px 1px 0px 0px inset;
 
+    /* Liquid Glass tiered ingredients — light-theme balances of the dark ones
+       (see the [data-glass] block below). */
+    --glass-blur-rich: blur(44px) saturate(1.9);
+    --glass-specular:
+        rgba(255, 255, 255, 0.95) 0px 1px 0px 0px inset,
+        rgba(255, 255, 255, 0.55) 1px 0px 0px 0px inset,
+        rgba(0, 0, 0, 0.08) 0px -1px 0px 0px inset,
+        rgba(0, 0, 0, 0.05) -1px 0px 0px 0px inset;
+    --elevate-2: 0 10px 30px rgba(80, 40, 20, 0.18), 0 2px 8px rgba(80, 40, 20, 0.10);
+    --elevate-3:
+        0 18px 56px -8px rgba(80, 40, 20, 0.22),
+        0 4px 16px rgba(80, 40, 20, 0.12),
+        0 0 0 1px var(--border-strong);
+
     /* wallpaper — slightly stronger orbs so frosted white panels still
        show the colour washes through. */
     --wallpaper:
@@ -179,6 +213,33 @@
         radial-gradient(ellipse 50% 60% at 100% 100%, rgba(120, 80, 200, 0.16) 0%, transparent 70%),
         radial-gradient(ellipse 40% 50% at 100% 0%, rgba(215, 132, 113, 0.15) 0%, transparent 60%),
         radial-gradient(ellipse 35% 40% at 50% 100%, rgba(160, 80, 180, 0.12) 0%, transparent 60%);
+}
+
+/* ─── Liquid Glass tiers ────────────────────────────────────────────────
+   Richness scales to the machine via :root[data-glass], set by app.js at boot
+   (probe: reduced-motion → lite, else a coarse CPU/RAM heuristic; a persisted
+   override wins). Token-driven: these blocks REDEFINE existing tokens, so every
+   surface that already reads them upgrades at once — and var() resolves each
+   against the element's theme-scoped custom props, so both themes come for free.
+
+     lite     — the base tokens above, untouched. No backdrop-filter on any
+                scrolling surface, tints only. The safe floor.
+     balanced — + static specular edge highlight & deeper stacked shadows.
+                Pure box-shadows: zero per-frame cost, safe on mid hardware.
+     rich     — + a richer live --glass-blur (only ever read by proven-static
+                glass regions — titlebar, header, sidebar, menus, modals) and a
+                subtle animated sheen on the primary action.
+
+   No NEW backdrop-filter is introduced on any scrolling/animating surface;
+   rich merely raises the blur radius on regions that already blur statically. */
+:root[data-glass="balanced"],
+:root[data-glass="rich"] {
+    --glass-shimmer: var(--glass-specular);
+    --shadow-menu:  var(--elevate-2);
+    --shadow-modal: var(--elevate-3);
+}
+:root[data-glass="rich"] {
+    --glass-blur: var(--glass-blur-rich);
 }
 
 /* ─── Reset & base ─── */
@@ -3798,6 +3859,37 @@ footer {
     box-shadow: none;
 }
 #send-btn.hidden { display: none; }
+
+/* Animated specular sheen on the primary send action — RICH tier only. A single
+   translucent highlight sweeps across on a slow loop; it animates only a 36px
+   circular button (tiny paint area), never a large surface. reduced-motion
+   neutralizes it via the global animation-duration override; lite/balanced
+   never mount the ::after. */
+:root[data-glass="rich"] #send-btn {
+    position: relative;
+    overflow: hidden;
+}
+:root[data-glass="rich"] #send-btn::after {
+    content: "";
+    position: absolute;
+    top: 0;
+    left: -60%;
+    width: 40%;
+    height: 100%;
+    background: linear-gradient(
+        100deg,
+        transparent 0%,
+        rgba(255, 255, 255, 0.35) 50%,
+        transparent 100%);
+    transform: skewX(-18deg);
+    pointer-events: none;
+    animation: send-sheen 4.5s var(--ease) infinite;
+}
+@keyframes send-sheen {
+    0%, 65% { left: -60%; opacity: 0; }
+    72%     { opacity: 1; }
+    100%    { left: 130%; opacity: 0; }
+}
 
 .send-icon {
     display: inline-flex;
