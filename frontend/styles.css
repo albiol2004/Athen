@@ -367,27 +367,53 @@ body::before {
 :root[data-glass="rich"] body::after {
     content: '';
     position: fixed;
-    inset: -20%;
+    inset: -25%;
     z-index: -1;
     pointer-events: none;
     background: var(--wallpaper);
     opacity: 0.55;
     will-change: transform, opacity;
     transform: translate3d(0, 0, 0);
-    animation: wallpaper-drift 52s ease-in-out infinite alternate;
+    animation: wallpaper-drift 38s ease-in-out infinite alternate;
+}
+
+/* Second, independent parallax layer on the ROOT (html) pseudo-element —
+   distinct from body::after above. It drifts on a different period and the
+   opposite direction so the two orb copies slide across each other, giving the
+   ambient background real depth + visible life instead of one uniform sweep.
+   Same compositor-only contract: transform/opacity only, single cached raster. */
+:root[data-glass="rich"]::after {
+    content: '';
+    position: fixed;
+    inset: -25%;
+    z-index: -1;
+    pointer-events: none;
+    background: var(--wallpaper);
+    opacity: 0.4;
+    will-change: transform, opacity;
+    transform: translate3d(0, 0, 0);
+    animation: wallpaper-drift-2 47s ease-in-out infinite alternate;
 }
 
 @keyframes wallpaper-drift {
-    0%   { transform: translate3d(-2%, -1.5%, 0) scale(1.05) rotate(-0.6deg); opacity: 0.45; }
-    50%  { transform: translate3d(1.5%, 1%, 0)   scale(1.12) rotate(0.4deg);  opacity: 0.60; }
-    100% { transform: translate3d(2.5%, 2%, 0)   scale(1.06) rotate(0.8deg);  opacity: 0.50; }
+    0%   { transform: translate3d(-4%, -3%, 0)  scale(1.06) rotate(-1.2deg); opacity: 0.42; }
+    50%  { transform: translate3d(3%, 2.5%, 0)  scale(1.16) rotate(0.8deg);  opacity: 0.62; }
+    100% { transform: translate3d(5%, 4%, 0)    scale(1.08) rotate(1.6deg);  opacity: 0.5; }
 }
 
-/* Reduced motion: freeze the drift to a static wallpaper (the global
-   reduce block above already neutralizes it; this makes the intent explicit
-   for the rich-tier layer regardless of tier). */
+/* Opposite-direction companion drift for the parallax layer. */
+@keyframes wallpaper-drift-2 {
+    0%   { transform: translate3d(4%, 3%, 0)    scale(1.12) rotate(1.4deg);  opacity: 0.5; }
+    50%  { transform: translate3d(-3.5%, -2%, 0) scale(1.05) rotate(-0.9deg); opacity: 0.32; }
+    100% { transform: translate3d(-5%, -4%, 0)  scale(1.14) rotate(-1.8deg); opacity: 0.46; }
+}
+
+/* Reduced motion: freeze both drift layers to a static wallpaper (the global
+   reduce block above already neutralizes them; this makes the intent explicit
+   for the rich-tier layers regardless of tier). */
 @media (prefers-reduced-motion: reduce) {
-    :root[data-glass="rich"] body::after { animation: none; }
+    :root[data-glass="rich"] body::after,
+    :root[data-glass="rich"]::after { animation: none; }
 }
 
 /* ─── Custom titlebar (macOS-style) ─── */
