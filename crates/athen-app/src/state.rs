@@ -513,6 +513,17 @@ pub struct AppState {
     /// Shutdown sender for the autonomous dispatch loop. `None` until
     /// `start_dispatch_loop` has been called.
     pub dispatch_loop_shutdown: Option<tokio::sync::broadcast::Sender<()>>,
+    /// Boot-race gate. Set true (via `mark_stack_ready`) at the very end of
+    /// the boot sequence, once the provider/config/router stack and monitors
+    /// are wired. The wake-up scheduler awaits this before its first tick: a
+    /// wake-up missed while the app was closed fires on the first 5s tick, and
+    /// without the gate that catch-up fire can race initialization and fail
+    /// into the silent-loss paths this mission is closing.
+    pub stack_ready: Arc<AtomicBool>,
+    /// Wakes the scheduler's boot-race gate the moment `mark_stack_ready`
+    /// runs, so a catch-up fire happens within one tick of readiness rather
+    /// than after a magic sleep.
+    pub stack_ready_signal: Arc<tokio::sync::Notify>,
     /// Arc compactor — the executor's gateway into arc history. The
     /// context-build path goes through `load_context_view` so the
     /// compaction summary (and tool-cache) replace raw entries when an
@@ -988,6 +999,22 @@ pub(crate) async fn assemble_base_app_tool_registry(
 /// run that survived at least [`SUPERVISION_HEALTHY_RUN`]** — i.e. a monitor
 /// that ran fine for a while and then dies once doesn't inherit the penalty
 /// of an earlier crash storm. A clean stop never sleeps or respawns.
+/// Park until the boot-race gate is released (see `AppState::stack_ready`).
+///
+/// Returns immediately once `ready` is set. The `notified()` future is
+/// created before the flag is re-checked and `mark_stack_ready` uses
+/// `notify_one` (which stores a permit when no waiter is parked), so a
+/// release that lands in the check→await window can never be lost.
+async fn await_stack_ready(ready: &AtomicBool, signal: &tokio::sync::Notify) {
+    while !ready.load(std::sync::atomic::Ordering::Acquire) {
+        let waiting = signal.notified();
+        if ready.load(std::sync::atomic::Ordering::Acquire) {
+            break;
+        }
+        waiting.await;
+    }
+}
+
 async fn spawn_supervised<F, Fut, S>(
     name: &'static str,
     initial_backoff: std::time::Duration,
@@ -1797,6 +1824,8 @@ impl AppState {
             pending_email_marks: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             dispatch_signal: Arc::new(tokio::sync::Notify::new()),
             dispatch_loop_shutdown: None,
+            stack_ready: Arc::new(AtomicBool::new(false)),
+            stack_ready_signal: Arc::new(tokio::sync::Notify::new()),
             compactor,
             web_search: std::sync::RwLock::new(web_search),
             email_sender: std::sync::RwLock::new(email_sender),
@@ -3484,6 +3513,21 @@ impl AppState {
     /// store isn't wired or the loop is already running. Calls
     /// `arm_unscheduled(now)` first so freshly-created rows that lack a
     /// `next_fire_at` get armed before the first tick.
+    /// Mark the provider/config/router stack + monitors as fully wired.
+    /// Called once at the very end of the boot sequence (desktop `lib.rs`
+    /// and headless `headless.rs`). Releases the wake-up scheduler's
+    /// boot-race gate so a catch-up fire of a missed wake-up runs against a
+    /// ready stack rather than racing initialization.
+    pub fn mark_stack_ready(&self) {
+        self.stack_ready
+            .store(true, std::sync::atomic::Ordering::Release);
+        // `notify_one` (not `notify_waiters`) stores a permit when no waiter
+        // is parked yet, so the scheduler gate can't miss the wake-up if it
+        // registers just after this call. There is exactly one waiter (the
+        // single scheduler attempt in its boot window).
+        self.stack_ready_signal.notify_one();
+    }
+
     pub fn start_wakeup_scheduler(&mut self, ui: crate::ui_bridge::UiBridge) {
         let Some(store) = self.wakeup_store.clone() else {
             tracing::debug!("No wake-up store wired; skipping scheduler");
@@ -3544,6 +3588,12 @@ impl AppState {
         let period = std::time::Duration::from_secs(5);
         let armed_once = Arc::new(AtomicBool::new(false));
         let stopped_for_check = Arc::clone(&stopped);
+        // Boot-race gate (see `stack_ready`): the first tick must not run
+        // before the provider/config/router stack finished wiring, or a
+        // catch-up fire of a wake-up missed while the app was closed fails
+        // into the silent-loss paths.
+        let stack_ready = Arc::clone(&self.stack_ready);
+        let stack_ready_signal = Arc::clone(&self.stack_ready_signal);
 
         // Tauri's setup hook is synchronous; use the Tauri-managed async
         // runtime for the same reason the email/calendar/telegram monitors
@@ -3559,7 +3609,13 @@ impl AppState {
                 let sink = Arc::clone(&sink);
                 let attempt_shutdown = Arc::clone(&attempt_shutdown);
                 let armed_once = Arc::clone(&armed_once);
+                let stack_ready = Arc::clone(&stack_ready);
+                let stack_ready_signal = Arc::clone(&stack_ready_signal);
                 async move {
+                    // Await end-of-boot readiness before the first tick. Stays
+                    // true across supervisor respawns, so later attempts fall
+                    // through immediately.
+                    await_stack_ready(&stack_ready, &stack_ready_signal).await;
                     let scheduler = athen_scheduler::WakeupScheduler::new(store, sink);
                     // Arm fresh rows once (first attempt only); a respawn must
                     // not re-arm rows the running scheduler already advanced.
@@ -4222,6 +4278,12 @@ impl AppState {
                             // Look-up failures fall through to "no wake-up" — the
                             // task still runs, just without restrictions.
                             let wakeup_id_opt = task_wakeup_map.read().await.get(&task.id).cloned();
+                            // Robust "originated from a wake-up" signal for the
+                            // failure ping below: the map membership holds even
+                            // if the wake-up row itself is unreadable at dispatch
+                            // (unlike `wakeup_for_ctx`, which needs a successful
+                            // store lookup).
+                            let is_wakeup_task = wakeup_id_opt.is_some();
                             let wakeup_for_ctx = if let (Some(id), Some(store)) =
                                 (wakeup_id_opt, wakeup_store.as_ref())
                             {
@@ -4375,6 +4437,12 @@ impl AppState {
                             let pending_email_marks_clone = Arc::clone(&pending_email_marks);
                             let vault_snapshot = vault_snapshot.clone();
                             let config_cache = Arc::clone(&config_cache);
+                            // Reuse the SAME notifier snapshot the co-located
+                            // success ping rides (`ctx.notifier`, from
+                            // `self.notifier.load_full()` at loop start) so the
+                            // wake-up failure ping behaves identically to it.
+                            let notifier_for_dispatch = notifier.clone();
+                            let arc_store_ping = arc_store.clone();
                             tauri::async_runtime::spawn(async move {
                                 // Fire-and-forget finalization task: its JoinHandle is
                                 // dropped, so a panic inside `execute_dispatched_task`
@@ -4429,6 +4497,69 @@ impl AppState {
                                         warn!(task_id = %task_id, arc = %arc_id, error = %e, "Autonomous task failed");
                                     }
                                 }
+
+                                // Wake-up task-failure ping (GOAL item 1). The
+                                // completion ping is success-gated inside
+                                // `execute_dispatched_task`; a wake-up that FAILS
+                                // here would otherwise be silent (only a `warn!`).
+                                // This seam covers BOTH failure arms — `Err(_)`
+                                // and `Ok(Some(o))` with `success == false` — and
+                                // never the success/skip arms, so it cannot
+                                // double-ping the completion toast. Scoped to
+                                // wake-up-origin tasks only: sense events
+                                // (email/Telegram) self-heal by re-triggering
+                                // (the source is left UNSEEN for the next poll).
+                                let is_failure = outcome.is_err()
+                                    || matches!(&outcome, Ok(Some(o)) if !o.success);
+                                if is_wakeup_task && is_failure {
+                                    if let Some(ref notifier) = notifier_for_dispatch {
+                                        let arc_name = if let Some(ref store) = arc_store_ping {
+                                            match store.get_arc(&arc_id).await {
+                                                Ok(Some(meta)) => meta.name,
+                                                _ => arc_id.clone(),
+                                            }
+                                        } else {
+                                            arc_id.clone()
+                                        };
+                                        let reason = match &outcome {
+                                            Err(e) => e.clone(),
+                                            Ok(Some(o)) if !o.content.is_empty() => o.content.clone(),
+                                            _ => "The wake-up task did not complete successfully."
+                                                .to_string(),
+                                        };
+                                        let body = if reason.chars().count() > 140 {
+                                            let cap = reason.floor_char_boundary(140);
+                                            format!("{}...", &reason[..cap])
+                                        } else {
+                                            reason.clone()
+                                        };
+                                        // Carry the full text for chat channels
+                                        // (Telegram); the 140-char body is the
+                                        // InApp toast preview — mirrors the
+                                        // success ping's body/body_long split.
+                                        let body_long = if reason.chars().count() > 140 {
+                                            Some(reason.clone())
+                                        } else {
+                                            None
+                                        };
+                                        let notification = athen_core::notification::Notification {
+                                            id: uuid::Uuid::new_v4(),
+                                            urgency:
+                                                athen_core::notification::NotificationUrgency::Medium,
+                                            title: format!("Athen couldn't finish: {arc_name}"),
+                                            body,
+                                            origin: athen_core::notification::NotificationOrigin::Agent,
+                                            arc_id: Some(arc_id.clone()),
+                                            task_id: None,
+                                            created_at: chrono::Utc::now(),
+                                            requires_response: false,
+                                            skip_humanize: true,
+                                            body_long,
+                                        };
+                                        notifier.notify(notification).await;
+                                    }
+                                }
+
                                 // Always remove the mapping entry so the table
                                 // doesn't leak even on failure.
                                 task_arc_map_clone.write().await.remove(&task_id);
@@ -8040,6 +8171,75 @@ mod supervisor_tests {
             0,
             "factory must not run when stop is requested up front"
         );
+    }
+}
+
+#[cfg(test)]
+mod boot_gate_tests {
+    use super::await_stack_ready;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    // Already-ready: the gate returns immediately (models a supervisor
+    // respawn after boot, and the case where readiness landed before the
+    // task ever polled).
+    #[tokio::test]
+    async fn returns_immediately_when_already_ready() {
+        let ready = Arc::new(AtomicBool::new(true));
+        let signal = Arc::new(tokio::sync::Notify::new());
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            await_stack_ready(&ready, &signal),
+        )
+        .await
+        .expect("gate must not block when already ready");
+    }
+
+    // Not-ready: the gate parks until `mark_stack_ready`'s store + notify
+    // (mirrored here) releases it — and it releases within one notify, not a
+    // magic sleep.
+    #[tokio::test]
+    async fn parks_until_released() {
+        let ready = Arc::new(AtomicBool::new(false));
+        let signal = Arc::new(tokio::sync::Notify::new());
+        let ready_task = Arc::clone(&ready);
+        let signal_task = Arc::clone(&signal);
+        let handle = tokio::spawn(async move {
+            await_stack_ready(&ready_task, &signal_task).await;
+        });
+        // Give the task time to park on the gate, then confirm it hasn't
+        // finished (still waiting).
+        tokio::task::yield_now().await;
+        assert!(!handle.is_finished(), "gate must block before release");
+        // Release exactly as `mark_stack_ready` does.
+        ready.store(true, Ordering::Release);
+        signal.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("gate must unblock promptly after release")
+            .expect("gate task must not panic");
+    }
+
+    // Race window: a release that lands *between* the flag re-check and the
+    // await must not be lost — `notify_one`'s stored permit covers it. We
+    // fire the release before the task is even spawned so the permit is
+    // already parked when the waiter registers.
+    #[tokio::test]
+    async fn release_before_waiter_registers_is_not_lost() {
+        let ready = Arc::new(AtomicBool::new(false));
+        let signal = Arc::new(tokio::sync::Notify::new());
+        // Store the permit first (no waiter parked yet).
+        signal.notify_one();
+        // Now flip readiness and run the gate: it must observe readiness (the
+        // stored permit guarantees the await would wake even if it didn't).
+        ready.store(true, Ordering::Release);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            await_stack_ready(&ready, &signal),
+        )
+        .await
+        .expect("a release delivered before the waiter registers must not hang the gate");
     }
 }
 

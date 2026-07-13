@@ -505,6 +505,10 @@ pub fn run() {
             // then every 15 min; rate-limits to 1 hint per hour.
             state.start_proactive_hint_checker(ui.clone());
 
+            // Boot sequence complete: release the wake-up scheduler's
+            // boot-race gate so a catch-up fire runs against a ready stack.
+            state.mark_stack_ready();
+
             app.manage(state);
 
             // HTTP API for remote clients. Spawned only after

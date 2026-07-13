@@ -161,6 +161,10 @@ pub fn run_headless() {
     state.start_wakeup_scheduler(ui.clone());
     state.start_agent_run_pruner();
 
+    // Boot sequence complete: release the wake-up scheduler's boot-race gate
+    // so a catch-up fire runs against a ready stack rather than racing init.
+    state.mark_stack_ready();
+
     // Publish the state singleton, then start the one loop that resolves
     // state through the bridge eagerly. Loops started above only touch
     // `UiBridge::app_state()` on their first event (network-latency away),
