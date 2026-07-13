@@ -109,7 +109,7 @@
        only) so the fixed wallpaper gradient shows through blurred. Lower alpha
        than --glass-bg-soft — the blur, not the tint, provides legibility, but
        kept high enough that chat text stays readable over the busy gradient. */
-    --glass-bg-app-frost: rgba(19, 18, 18, 0.60);
+    --glass-bg-app-frost: rgba(19, 18, 18, 0.46);
     --glass-blur:    blur(16px) saturate(1.4);
     --overlay-blur:  blur(4px);
     --glass-border:  rgba(255, 255, 255, 0.06);
@@ -197,7 +197,7 @@
     --glass-bg:      rgba(255, 255, 255, 0.55);
     --glass-bg-strong: rgba(255, 255, 255, 0.95);
     --glass-bg-soft: rgba(255, 255, 255, 0.82);
-    --glass-bg-app-frost: rgba(255, 255, 255, 0.60);
+    --glass-bg-app-frost: rgba(255, 255, 255, 0.50);
     --glass-blur:    blur(24px) saturate(1.6);
     --overlay-blur:  blur(4px);
     --glass-border:  rgba(0, 0, 0, 0.06);

@@ -1242,14 +1242,18 @@ async function loadAgentProfiles() {
     if (!invoke) return;
     try {
         agentProfiles = await invoke('list_agent_profiles');
-        renderProfilePicker();
-        renderReasoningPicker();
-        renderTierPicker();
-        renderSecurityPicker();
     } catch (err) {
         console.error('Failed to load agent profiles:', err);
         agentProfiles = [];
     }
+    // Always render, even on failure — otherwise the profile <select> is left
+    // in its initial EMPTY state, and the enhanced dropdown is then a clickable
+    // trigger that opens an empty (invisible) popup. On error this degrades to
+    // the seeded "Default" option instead of a dead control.
+    renderProfilePicker();
+    renderReasoningPicker();
+    renderTierPicker();
+    renderSecurityPicker();
 }
 
 function renderProfilePicker() {
@@ -8694,8 +8698,17 @@ function enhanceSelect(sel) {
         if (returnFocus) trigger.focus();
     }
 
-    function openPopup() {
+    async function openPopup() {
         if (popup || sel.disabled) return;
+        // Self-heal: if the select is empty (e.g. an async-populated picker
+        // whose load failed or hasn't landed), try to (re)load before opening,
+        // so the user never gets a dead trigger that opens an empty popup.
+        if (sel.options.length === 0 && typeof sel._athenReload === 'function') {
+            try { await sel._athenReload(); } catch (_) {}
+            if (popup || sel.disabled || sel.options.length === 0) return;
+        } else if (sel.options.length === 0) {
+            return; // nothing to show and no way to populate — don't open a phantom
+        }
         if (openSelectDropdown) openSelectDropdown.close(false);
         popup = document.createElement('div');
         popup.className = 'select-popup';
@@ -8767,6 +8780,10 @@ function enhanceHeaderSelects() {
             const el = document.getElementById(id);
             if (el) enhanceSelect(el);
         });
+    // The profile picker is populated asynchronously from list_agent_profiles;
+    // let its dropdown self-heal by re-fetching if opened while still empty.
+    const profileSel = document.getElementById('arc-profile-picker');
+    if (profileSel) profileSel._athenReload = loadAgentProfiles;
 }
 enhanceHeaderSelects();
 
