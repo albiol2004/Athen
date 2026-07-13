@@ -45,6 +45,63 @@ use crate::vault_creds::endpoint_scope;
 /// `slack__post_message` resolves to mcp_id="slack", tool="post_message".
 const MCP_TOOL_SEPARATOR: &str = "__";
 
+/// Upper bound on the in-memory buffering of an `http_request` response
+/// body when the caller did NOT ask to save it to disk. Past this the tool
+/// returns a `response_too_large` error instead of buffering the whole body
+/// into RAM (and then re-allocating it again as a parsed JSON `Value`), so a
+/// pathological or hostile upstream can't OOM the long-running daemon.
+///
+/// DECISION: 100 MiB. Generous — no legitimate JSON/text API reply the agent
+/// consumes inline approaches this; binary downloads use `save_to` and get the
+/// higher [`HTTP_MAX_SAVE_BYTES`] bound. Human may tune.
+const HTTP_MAX_IN_MEMORY_BYTES: usize = 100 * 1024 * 1024;
+
+/// Upper bound on an `http_request` response body when the caller asked to
+/// save it to disk (`save_to`). Higher than the inline cap because the bytes
+/// are written straight out and never parsed, but still bounded so a runaway
+/// stream can't exhaust RAM before it reaches disk. (True zero-buffer
+/// streaming-to-disk is a future lever — see REPORT.)
+///
+/// DECISION: 512 MiB. Human may tune.
+const HTTP_MAX_SAVE_BYTES: usize = 512 * 1024 * 1024;
+
+/// True when appending a `chunk_len`-byte chunk to a `current_len`-byte
+/// buffer would exceed `cap`. Uses saturating arithmetic so an absurd chunk
+/// length can never wrap the addition and defeat the guard. Pure + sync so
+/// the size-guard boundary is unit-testable without a live HTTP server.
+#[inline]
+fn body_chunk_would_overflow(current_len: usize, chunk_len: usize, cap: usize) -> bool {
+    current_len.saturating_add(chunk_len) > cap
+}
+
+/// Read a response body into memory, aborting once it would exceed `cap`.
+///
+/// Behaviour-neutral for any body at or under `cap`: the returned bytes are
+/// byte-for-byte what `response.bytes().await` would have produced (chunks
+/// concatenated in arrival order). Only the pathological oversize case
+/// changes — it errors instead of buffering unboundedly.
+async fn read_body_capped(
+    mut response: reqwest::Response,
+    cap: usize,
+) -> std::result::Result<Vec<u8>, BodyReadError> {
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(BodyReadError::Io)? {
+        if body_chunk_would_overflow(buf.len(), chunk.len(), cap) {
+            return Err(BodyReadError::TooLarge);
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
+/// Failure modes of [`read_body_capped`].
+enum BodyReadError {
+    /// The transport failed mid-body (mirrors the old `.bytes()` error).
+    Io(reqwest::Error),
+    /// The body exceeded the caller's cap and was abandoned.
+    TooLarge,
+}
+
 /// Outcome of an agent-triggered deep_research run.
 pub enum DeepResearchRun {
     Done(crate::commands::DeepResearchResult),
@@ -2657,14 +2714,63 @@ impl AppToolRegistry {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
-        // Pull bytes first so we always have a length, then decode UTF-8
-        // with replacement so a single bad sequence doesn't blank the
+        // Cap the in-memory body so a pathological/hostile upstream can't OOM
+        // the daemon. Inline (agent-visible) replies get the tighter cap since
+        // they're also re-allocated as a parsed JSON `Value`; `save_to`
+        // downloads get the higher disk bound.
+        let body_cap = if save_to.is_some() {
+            HTTP_MAX_SAVE_BYTES
+        } else {
+            HTTP_MAX_IN_MEMORY_BYTES
+        };
+        // Cheap early-out on an honest oversize `Content-Length`, before we
+        // stream a single byte. Chunked / lying servers are still caught by
+        // the streaming guard inside `read_body_capped`.
+        if let Some(declared) = response.content_length() {
+            if declared > body_cap as u64 {
+                let msg = format!(
+                    "Response body too large: declared {declared} bytes exceeds the {body_cap}-byte limit"
+                );
+                return Ok(ToolResult {
+                    success: false,
+                    output: json!({
+                        "error": "response_too_large",
+                        "endpoint": endpoint.name,
+                        "status": status.as_u16(),
+                        "limit_bytes": body_cap,
+                        "declared_bytes": declared,
+                        "detail": msg,
+                    }),
+                    error: Some(msg),
+                    execution_time_ms: started.elapsed().as_millis() as u64,
+                });
+            }
+        }
+        // Stream the body into memory, bounded by `body_cap`, then decode
+        // UTF-8 with replacement so a single bad sequence doesn't blank the
         // body. The previous `.text().unwrap_or_default()` was the source
         // of empty-body reports — a decompression error or invalid UTF-8
         // silently coerced to "".
-        let bytes = match response.bytes().await {
+        let bytes = match read_body_capped(response, body_cap).await {
             Ok(b) => b,
-            Err(e) => {
+            Err(BodyReadError::TooLarge) => {
+                let msg = format!(
+                    "Response body too large: exceeded the {body_cap}-byte limit while streaming"
+                );
+                return Ok(ToolResult {
+                    success: false,
+                    output: json!({
+                        "error": "response_too_large",
+                        "endpoint": endpoint.name,
+                        "status": status.as_u16(),
+                        "limit_bytes": body_cap,
+                        "detail": msg,
+                    }),
+                    error: Some(msg),
+                    execution_time_ms: started.elapsed().as_millis() as u64,
+                });
+            }
+            Err(BodyReadError::Io(e)) => {
                 let msg = format!("Body read failed: {e}");
                 let scrubbed = scrub_secret_text(&msg, &endpoint, vault, &scope).await;
                 return Ok(ToolResult {
@@ -3775,6 +3881,18 @@ mod tests {
     use athen_persistence::calendar::EventCreator;
     use athen_persistence::Database;
     use serde_json::json;
+
+    #[test]
+    fn body_cap_predicate_boundaries() {
+        // Exactly at the cap is allowed (not an overflow).
+        assert!(!body_chunk_would_overflow(90, 10, 100));
+        // One byte over is rejected.
+        assert!(body_chunk_would_overflow(90, 11, 100));
+        // Empty buffer + empty chunk under any cap is fine.
+        assert!(!body_chunk_would_overflow(0, 0, 100));
+        // Saturating add: an absurd chunk length can't wrap past the cap.
+        assert!(body_chunk_would_overflow(usize::MAX - 1, 5, 100));
+    }
 
     #[test]
     fn save_file_resolves_project_with_explicit_name() {

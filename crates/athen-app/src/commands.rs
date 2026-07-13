@@ -978,6 +978,30 @@ fn extract_key_terms(message: &str) -> Vec<String> {
         .collect()
 }
 
+/// True for the injected-memory system message that `reinforce_used_memories`
+/// reads. Single source of truth for the predicate so the pre-executor
+/// snapshot (`snapshot_memory_context`) and the reinforcement lookup can't
+/// drift apart.
+fn is_injected_memory_msg(m: &ChatMessage) -> bool {
+    matches!(m.role, Role::System)
+        && matches!(&m.content, MessageContent::Text(t) if t.starts_with("Relevant information"))
+}
+
+/// Snapshot only the message `reinforce_used_memories` actually reads (the
+/// injected-memory system message), instead of cloning the whole conversation
+/// history on every turn. `reinforce`'s `.find()` over this 0-or-1-element
+/// slice returns the same message it would have found in the full history, so
+/// this is byte-for-byte behavior-neutral — it just drops the wasted per-turn
+/// full-`Vec<ChatMessage>` clone.
+fn snapshot_memory_context(context: &[ChatMessage]) -> Vec<ChatMessage> {
+    context
+        .iter()
+        .find(|m| is_injected_memory_msg(m))
+        .cloned()
+        .into_iter()
+        .collect()
+}
+
 /// Reinforce graph edges for memories that were actually used in the response.
 /// Uses keyword overlap to detect usage -- zero LLM cost.
 async fn reinforce_used_memories(
@@ -995,10 +1019,7 @@ async fn reinforce_used_memories(
     }
 
     // Find the injected memory system message.
-    let memory_msg = context.iter().find(|m| {
-        matches!(m.role, Role::System)
-            && matches!(&m.content, MessageContent::Text(t) if t.starts_with("Relevant information"))
-    });
+    let memory_msg = context.iter().find(|m| is_injected_memory_msg(m));
 
     let Some(ChatMessage {
         content: MessageContent::Text(memory_text),
@@ -1155,6 +1176,76 @@ mod memory_judge_filter_tests {
         ] {
             assert!(is_substantive_user_msg(msg), "expected accept: {msg:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod snapshot_memory_context_tests {
+    use super::{is_injected_memory_msg, snapshot_memory_context};
+    use athen_core::llm::{ChatMessage, MessageContent, Role};
+
+    fn msg(role: Role, text: &str) -> ChatMessage {
+        ChatMessage {
+            role,
+            content: MessageContent::Text(text.to_string()),
+        }
+    }
+
+    // ChatMessage doesn't derive PartialEq; project to (role, text) for
+    // comparison. Preserves the identity we care about for reinforcement.
+    fn proj(m: &ChatMessage) -> (Role, &str) {
+        let text = match &m.content {
+            MessageContent::Text(t) => t.as_str(),
+            _ => "",
+        };
+        (m.role, text)
+    }
+
+    fn full_history() -> Vec<ChatMessage> {
+        vec![
+            msg(Role::User, "hello there"),
+            msg(Role::System, "Relevant information from memory:\n- fact"),
+            msg(Role::Assistant, "hi"),
+            msg(Role::User, "another turn"),
+        ]
+    }
+
+    // The snapshot must contain exactly the message `reinforce_used_memories`
+    // would `.find()` in the full history — no more, no less. This is the
+    // behavior-neutrality contract of the per-turn full-clone trim.
+    #[test]
+    fn snapshot_equals_reinforce_find_over_full_history() {
+        let full = full_history();
+        let expected = full.iter().find(|m| is_injected_memory_msg(m)).map(proj);
+        let snap = snapshot_memory_context(&full);
+        let got = snap.iter().find(|m| is_injected_memory_msg(m)).map(proj);
+        assert_eq!(expected, got);
+        assert_eq!(snap.len(), 1);
+    }
+
+    #[test]
+    fn no_injected_memory_msg_yields_empty_snapshot() {
+        let history = vec![
+            msg(Role::User, "hi"),
+            msg(Role::Assistant, "hello"),
+            // A non-matching system message must NOT be captured.
+            msg(Role::System, "You are a helpful assistant"),
+        ];
+        assert!(snapshot_memory_context(&history).is_empty());
+        // Reinforce would also find nothing → identical behavior.
+        assert!(!history.iter().any(is_injected_memory_msg));
+    }
+
+    #[test]
+    fn captures_only_the_first_match_like_find() {
+        let history = vec![
+            msg(Role::System, "Relevant information A"),
+            msg(Role::System, "Relevant information B"),
+        ];
+        let snap = snapshot_memory_context(&history);
+        assert_eq!(snap.len(), 1);
+        // `.find()` returns the first; snapshot must preserve that exact one.
+        assert_eq!(snap.first().map(proj), history.first().map(proj));
     }
 }
 
@@ -3005,8 +3096,9 @@ pub(crate) async fn send_message_core(
                 .map(|g| g.cancel_flag())
                 .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
 
-            // Snapshot context for post-response reinforcement.
-            let context_snapshot = context.clone();
+            // Snapshot (only) the injected-memory message for post-response
+            // reinforcement — not the whole history.
+            let context_snapshot = snapshot_memory_context(&context);
 
             let active_profile = resolve_active_profile(
                 state.profile_store.as_ref(),
@@ -4445,7 +4537,7 @@ pub(crate) async fn execute_approved_task(
         .map(|g| g.cancel_flag())
         .unwrap_or_else(|| Arc::clone(&ctx.cancel_flag));
 
-    let context_snapshot = context.clone();
+    let context_snapshot = snapshot_memory_context(&context);
 
     let active_profile = resolve_active_profile(
         ctx.profile_store.as_ref(),
@@ -5633,7 +5725,7 @@ pub(crate) async fn execute_dispatched_task(
         .map(|g| g.cancel_flag())
         .unwrap_or_else(|| Arc::clone(&ctx.cancel_flag));
 
-    let context_snapshot = context.clone();
+    let context_snapshot = snapshot_memory_context(&context);
 
     let active_profile =
         resolve_active_profile(ctx.profile_store.as_ref(), ctx.arc_store.as_ref(), &arc_id).await;

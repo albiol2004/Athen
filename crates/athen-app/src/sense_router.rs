@@ -618,6 +618,14 @@ pub async fn process_sense_event(
             let router = Arc::clone(router);
             let coordinator = coordinator.cloned();
             let task_arc_map = task_arc_map.cloned();
+            // An email-mark entry was parked for this HumanConfirm task at
+            // Step 4 (email senses only; `None` for Telegram). The dispatch
+            // loop drains it ONLY when the task is approved and dispatched —
+            // on deny / timeout / router failure / panic the task never
+            // reaches the dispatch loop, so without cleanup here the entry
+            // would leak for the whole process lifetime. Cloned in so the
+            // guard below can drain it on every non-dispatch exit path.
+            let pending_email_marks = pending_email_marks.cloned();
             let dispatch_signal = dispatch_signal.cloned();
             // Clone the notifier into the spawned task so any failure in the
             // approval flow can SURFACE to the owner instead of dying as a
@@ -629,6 +637,40 @@ pub async fn process_sense_event(
             let summary_c = summary.to_string();
             let reason_c = triage.reason.clone();
             tokio::spawn(async move {
+                // RAII cleanup for the parked email-mark entry (see the
+                // `pending_email_marks` capture above). Drops the entry on
+                // every exit path — deny, unknown choice, router error, and
+                // panic (Drop runs on unwind) — mirroring the inflight/loop
+                // guards. DISARMED on the approve arm so the dispatch-loop
+                // finalization keeps ownership of the removal AND the
+                // success-path `\Seen` mark. Behavior-neutral: on a
+                // non-approve exit the email is intentionally left UNSEEN
+                // (re-triggers next poll) whether or not the entry lingers —
+                // removing it only reclaims memory.
+                struct EmailMarkGuard {
+                    map: Option<crate::state::PendingEmailMarks>,
+                    task_id: Uuid,
+                    armed: bool,
+                }
+                impl Drop for EmailMarkGuard {
+                    fn drop(&mut self) {
+                        if !self.armed {
+                            return;
+                        }
+                        if let Some(map) = self.map.clone() {
+                            let id = self.task_id;
+                            tokio::spawn(async move {
+                                map.write().await.remove(&id);
+                            });
+                        }
+                    }
+                }
+                let mut email_mark_guard = EmailMarkGuard {
+                    map: pending_email_marks,
+                    task_id,
+                    armed: true,
+                };
+
                 // Helper: surface an approval-path failure to the owner through
                 // whatever notifier channels are configured (Telegram / in-app).
                 // We never want an approved-or-abandoned task to vanish with only
@@ -701,6 +743,11 @@ pub async fn process_sense_event(
                             if let Some(map) = task_arc_map {
                                 map.write().await.insert(task_id, arc_id_c.clone());
                             }
+                            // Dispatch now owns the email-mark entry (drains it
+                            // in the loop finalization, and marks `\Seen` on
+                            // success). Disarm so the guard doesn't race-remove
+                            // it out from under that path.
+                            email_mark_guard.armed = false;
                             if let Some(sig) = dispatch_signal {
                                 sig.notify_one();
                             }
@@ -757,6 +804,13 @@ pub async fn process_sense_event(
                 arc = %arc_id,
                 "HumanConfirm decision but no approval_router wired — task will sit unactioned"
             );
+            // With no router the task can never be approved/dispatched, so the
+            // dispatch loop will never drain its parked email-mark entry. Drop
+            // it here so the un-actionable task doesn't leak the entry (the
+            // email stays UNSEEN either way — same non-approve semantics).
+            if let Some(map) = pending_email_marks {
+                map.write().await.remove(&task_id);
+            }
         }
     }
 
