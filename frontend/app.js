@@ -8708,26 +8708,12 @@ function enhanceSelect(sel) {
         if (returnFocus) trigger.focus();
     }
 
-    async function openPopup() {
-        if (popup || sel.disabled) return;
-        // Self-heal: if the select has no real options yet (an async-populated
-        // picker whose load failed or hasn't landed — the profile picker seeds
-        // only a placeholder "Default" and sets _athenNeedsReload), try to
-        // (re)load before opening, so a momentarily-empty list can still reveal
-        // profiles that loaded late instead of leaving a dead trigger.
-        const needsReload = typeof sel._athenReload === 'function' &&
-            (sel.options.length === 0 || sel._athenNeedsReload);
-        if (needsReload) {
-            try { await sel._athenReload(); } catch (_) {}
-            if (popup || sel.disabled) return;
-            if (sel.options.length === 0) return;
-        } else if (sel.options.length === 0) {
-            return; // nothing to show and no way to populate — don't open a phantom
-        }
-        if (openSelectDropdown) openSelectDropdown.close(false);
-        popup = document.createElement('div');
-        popup.className = 'select-popup';
-        popup.setAttribute('role', 'listbox');
+    // Build (or rebuild in place) the popup's option rows from the select's
+    // current options. Kept separate so a late background reload can refresh
+    // the rows without tearing the open popup down.
+    function renderPopupOptions() {
+        if (!popup) return;
+        popup.textContent = '';
         Array.from(sel.options).forEach((o, i) => {
             const item = document.createElement('div');
             item.className = 'select-option';
@@ -8740,11 +8726,50 @@ function enhanceSelect(sel) {
             item.addEventListener('mousemove', () => setActive(i));
             popup.appendChild(item);
         });
+    }
+
+    function openPopup() {
+        if (popup || sel.disabled) return;
+        // Self-heal: an async-populated picker (the profile picker) whose load
+        // failed or hasn't landed seeds a placeholder "Default" and sets
+        // _athenNeedsReload. We open SYNCHRONOUSLY with whatever options exist
+        // right now (never awaiting inside the open path — an await here splits
+        // the open across a microtask/IPC boundary and races the dismiss
+        // machinery, tearing the popup down immediately). If a reload is
+        // wanted, it fires in the background below and refreshes the rows in
+        // place once fresh options land.
+        const needsReload = typeof sel._athenReload === 'function' &&
+            (sel.options.length === 0 || sel._athenNeedsReload);
+        if (sel.options.length === 0 && !needsReload) {
+            return; // nothing to show and no way to populate — don't open a phantom
+        }
+        if (openSelectDropdown) openSelectDropdown.close(false);
+        popup = document.createElement('div');
+        popup.className = 'select-popup';
+        popup.setAttribute('role', 'listbox');
+        renderPopupOptions();
         document.body.appendChild(popup);
         positionPopup();
         trigger.setAttribute('aria-expanded', 'true');
         trigger.classList.add('open');
         setActive(sel.selectedIndex >= 0 ? sel.selectedIndex : 0);
+
+        // Non-blocking self-heal: fetch fresh options without ever awaiting in
+        // the open path. If the popup is still the same one when they land,
+        // rebuild the rows in place; otherwise the result is simply ignored.
+        if (needsReload) {
+            const openedPopup = popup;
+            Promise.resolve()
+                .then(() => sel._athenReload())
+                .then(() => {
+                    if (popup && popup === openedPopup) {
+                        renderPopupOptions();
+                        positionPopup();
+                        setActive(sel.selectedIndex >= 0 ? sel.selectedIndex : 0);
+                    }
+                })
+                .catch(() => {});
+        }
 
         const onDocClick = (e) => {
             if (popup && !popup.contains(e.target) && !trigger.contains(e.target)) closePopup(false);
