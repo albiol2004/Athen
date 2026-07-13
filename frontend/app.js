@@ -1261,10 +1261,20 @@ function renderProfilePicker() {
     if (!sel) return;
     if (!agentProfiles || agentProfiles.length === 0) {
         sel.innerHTML = '<option value="default">Default</option>';
-        sel.disabled = true;
+        // Disable ONLY on the shared no-active-arc rule (like the other three
+        // pickers) — NEVER purely because the list is empty. A disabled <button>
+        // swallows clicks, which would make the trigger a permanently dead
+        // control while the load is pending/failed/genuinely empty. Keeping it
+        // interactive lets a click re-fetch via _athenReload and still open the
+        // popup showing at least the seeded "Default". _athenNeedsReload tells
+        // openPopup() to re-attempt the async load even though the seeded
+        // placeholder means sel.options.length is 1 (not 0).
+        sel.disabled = !activeArcId;
+        sel._athenNeedsReload = true;
         if (sel._athenSync) sel._athenSync();
         return;
     }
+    sel._athenNeedsReload = false;
     sel.disabled = !activeArcId;
     const meta = activeArcId ? arcMetaById.get(activeArcId) : null;
     const activeId = (meta && meta.active_profile_id) || 'default';
@@ -8700,12 +8710,17 @@ function enhanceSelect(sel) {
 
     async function openPopup() {
         if (popup || sel.disabled) return;
-        // Self-heal: if the select is empty (e.g. an async-populated picker
-        // whose load failed or hasn't landed), try to (re)load before opening,
-        // so the user never gets a dead trigger that opens an empty popup.
-        if (sel.options.length === 0 && typeof sel._athenReload === 'function') {
+        // Self-heal: if the select has no real options yet (an async-populated
+        // picker whose load failed or hasn't landed — the profile picker seeds
+        // only a placeholder "Default" and sets _athenNeedsReload), try to
+        // (re)load before opening, so a momentarily-empty list can still reveal
+        // profiles that loaded late instead of leaving a dead trigger.
+        const needsReload = typeof sel._athenReload === 'function' &&
+            (sel.options.length === 0 || sel._athenNeedsReload);
+        if (needsReload) {
             try { await sel._athenReload(); } catch (_) {}
-            if (popup || sel.disabled || sel.options.length === 0) return;
+            if (popup || sel.disabled) return;
+            if (sel.options.length === 0) return;
         } else if (sel.options.length === 0) {
             return; // nothing to show and no way to populate — don't open a phantom
         }

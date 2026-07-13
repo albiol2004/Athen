@@ -354,6 +354,42 @@ body::before {
         var(--bg-deep);
 }
 
+/* ─── Ambient wallpaper drift (rich tier only) ───
+   A second fixed copy of the orb gradients, oversized past the viewport
+   (inset: -20% → 140% box) so a slow compositor-only transform never exposes a
+   hard edge. It rides on top of the static body::before baseline to make the
+   glows feel subtly alive without touching the colors. z-index -1 keeps it in
+   the same below-content plane as ::before (::after paints after, so it layers
+   over the static base, both below #app). Animate ONLY transform/opacity on
+   this GPU-promoted layer — never background-position or the gradient stops —
+   so it stays a single cached raster the compositor just nudges. Gated to
+   :root[data-glass="rich"]; balanced/lite keep the fully static wallpaper. */
+:root[data-glass="rich"] body::after {
+    content: '';
+    position: fixed;
+    inset: -20%;
+    z-index: -1;
+    pointer-events: none;
+    background: var(--wallpaper);
+    opacity: 0.55;
+    will-change: transform, opacity;
+    transform: translate3d(0, 0, 0);
+    animation: wallpaper-drift 52s ease-in-out infinite alternate;
+}
+
+@keyframes wallpaper-drift {
+    0%   { transform: translate3d(-2%, -1.5%, 0) scale(1.05) rotate(-0.6deg); opacity: 0.45; }
+    50%  { transform: translate3d(1.5%, 1%, 0)   scale(1.12) rotate(0.4deg);  opacity: 0.60; }
+    100% { transform: translate3d(2.5%, 2%, 0)   scale(1.06) rotate(0.8deg);  opacity: 0.50; }
+}
+
+/* Reduced motion: freeze the drift to a static wallpaper (the global
+   reduce block above already neutralizes it; this makes the intent explicit
+   for the rich-tier layer regardless of tier). */
+@media (prefers-reduced-motion: reduce) {
+    :root[data-glass="rich"] body::after { animation: none; }
+}
+
 /* ─── Custom titlebar (macOS-style) ─── */
 :root {
     --titlebar-h: 30px;
