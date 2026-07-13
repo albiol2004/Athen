@@ -265,27 +265,6 @@ impl GrantStore {
         })
     }
 
-    pub async fn revoke_global(&self, path: &Path, access: Access) -> Result<bool> {
-        let canonical = paths::canonicalize_loose(path);
-        let conn = self.conn.clone();
-        let path_str = canonical.to_string_lossy().to_string();
-        let access_int = access as i64;
-
-        tokio::task::spawn_blocking(move || {
-            let conn = conn.blocking_lock();
-            let n = conn
-                .execute(
-                    "DELETE FROM global_directory_grants \
-                     WHERE path = ?1 AND access = ?2",
-                    params![path_str, access_int],
-                )
-                .map_err(|e| AthenError::Other(format!("Revoke global grant: {e}")))?;
-            Ok(n > 0)
-        })
-        .await
-        .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
-    }
-
     pub async fn list_global(&self) -> Result<Vec<DirectoryGrant>> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {

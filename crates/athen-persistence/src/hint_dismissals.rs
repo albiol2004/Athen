@@ -5,19 +5,11 @@
 
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use rusqlite::{params, Connection};
-use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use athen_core::error::{AthenError, Result};
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HintDismissal {
-    pub hint_id: String,
-    pub permanent: bool,
-    pub dismissed_at: DateTime<Utc>,
-}
 
 #[derive(Clone)]
 pub struct HintDismissalStore {

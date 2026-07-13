@@ -1142,27 +1142,6 @@ impl ArcStore {
         .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
     }
 
-    /// Update the text content of a single entry.
-    pub async fn update_entry_content(&self, entry_id: i64, new_content: &str) -> Result<()> {
-        let conn = self.conn.clone();
-        let new_content = new_content.to_string();
-        tokio::task::spawn_blocking(move || {
-            let conn = conn.blocking_lock();
-            let changed = conn
-                .execute(
-                    "UPDATE arc_entries SET content = ?1 WHERE id = ?2",
-                    params![new_content, entry_id],
-                )
-                .map_err(|e| AthenError::Other(format!("Update entry content: {e}")))?;
-            if changed == 0 {
-                return Err(AthenError::Other(format!("Entry {entry_id} not found")));
-            }
-            Ok(())
-        })
-        .await
-        .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
-    }
-
     /// Copy all entries from `source_arc_id` up to and including
     /// `up_to_entry_id` into `target_arc_id`. Returns the number of
     /// entries copied. The new entries get fresh auto-increment IDs.

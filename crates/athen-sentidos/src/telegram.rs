@@ -160,6 +160,7 @@ pub struct TelegramVideo {
 /// `https://api.telegram.org/file/bot<TOKEN>/<file_path>`.
 #[derive(Debug, Clone, Deserialize)]
 struct TelegramFileMeta {
+    // Deserialized to mirror the Bot API payload; only file_path is read.
     #[allow(dead_code)]
     file_id: String,
     file_path: Option<String>,

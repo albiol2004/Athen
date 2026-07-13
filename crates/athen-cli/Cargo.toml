@@ -9,13 +9,9 @@ athen-coordinador = { workspace = true }
 athen-agent = { workspace = true }
 athen-llm = { workspace = true }
 athen-risk = { workspace = true }
-athen-contacts = { workspace = true }
-athen-sentidos = { workspace = true }
 athen-persistence = { workspace = true }
-athen-shell = { workspace = true }
 athen-vault = { workspace = true }
 tokio = { workspace = true }
-tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }

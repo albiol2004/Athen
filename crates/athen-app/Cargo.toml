@@ -5,7 +5,6 @@ edition = "2021"
 
 [dependencies]
 athen-core = { workspace = true }
-athen-ipc = { workspace = true }
 athen-coordinador = { workspace = true }
 athen-llm = { workspace = true }
 athen-risk = { workspace = true }

@@ -28,7 +28,8 @@ members = [
 [workspace.dependencies]
 # Internal
 athen-core = { path = "crates/athen-core" }
-athen-ipc = { path = "crates/athen-ipc" }
+# athen-ipc stays a workspace member (own tests + future multi-process split)
+# but no crate currently links it, so it has no [workspace.dependencies] alias.
 athen-persistence = { path = "crates/athen-persistence" }
 athen-risk = { path = "crates/athen-risk" }
 athen-contacts = { path = "crates/athen-contacts" }
@@ -48,7 +49,11 @@ athen-checkpoint = { path = "crates/athen-checkpoint" }
 athen-voice = { path = "crates/athen-voice" }
 
 # External
-tokio = { version = "1", features = ["full"] }
+# tokio "full" trimmed to the features the workspace actually references (grep
+# evidence in loop/REPORT.md). Dropped vs "full": io-std (zero tokio::io::std*
+# call sites) and parking_lot (internal lock impl only; behavior-identical).
+# Per-crate dev-dependencies keep ["full", "test-util"] and are unaffected.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "process", "net", "signal", "io-util"] }
 tokio-stream = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -62,7 +67,11 @@ async-trait = "0.1"
 url = { version = "2", features = ["serde"] }
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "gzip", "brotli", "deflate", "multipart"] }
-futures = "0.3"
+# Trimmed defaults: workspace uses only Stream/StreamExt/FutureExt/join_all/
+# select_ok (all in futures-util "std"); zero executor/async-await-macro/
+# channel/io/sink call sites (grep evidence in loop/REPORT.md), so the
+# futures-executor and futures-macro subcrates are dropped.
+futures = { version = "0.3", default-features = false, features = ["std"] }
 arc-swap = "1"
 toml = "0.8"
 imap = { version = "2.4", default-features = false }
@@ -77,6 +86,11 @@ base64 = "0.22"
 quick-xml = "0.36"
 
 [profile.release]
-strip = true
-lto = "thin"
-codegen-units = 1
+strip = true          # drop symbols/debuginfo from the shipped binary
+lto = "fat"           # whole-program LTO: better cross-crate inlining + dead-code elim than "thin"; release-only build-time cost
+codegen-units = 1     # single CGU maximizes optimization/dedup across the crate
+# opt-level left at default 3 — "s" is a size-vs-speed DECISION for the human (see loop/REPORT.md)
+# panic = "abort" intentionally NOT set: workspace code relies on unwinding
+# (catch_unwind panic containment in athen-scheduler ticks, athen-app approval
+# routers/background loops, loop_mode LoopLock RAII release) — abort would
+# turn contained panics into process death.

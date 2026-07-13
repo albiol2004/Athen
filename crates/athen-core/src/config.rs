@@ -818,15 +818,6 @@ impl BundledTier {
         }
     }
 
-    /// Short label suitable for the Settings dropdown when the
-    /// frontend hasn't localised the option (e.g. "Light (270MB)").
-    pub fn human_label(&self) -> &'static str {
-        match self {
-            BundledTier::Light => "Light (270MB)",
-            BundledTier::Standard => "Standard (530MB)",
-            BundledTier::HighQuality => "High quality (1.2GB)",
-        }
-    }
 }
 
 /// How the embedding provider is selected.

@@ -10,7 +10,6 @@ description = "Athen admin panel + gateway: multi-instance provisioning, user au
 
 [dependencies]
 tokio = { workspace = true }
-tokio-stream = { workspace = true }
 axum = "0.8"
 serde = { workspace = true }
 serde_json = { workspace = true }

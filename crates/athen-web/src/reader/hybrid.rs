@@ -45,23 +45,6 @@ impl HybridReader {
         }
     }
 
-    /// Replace the primary (default `LocalReader`).
-    pub fn with_primary(mut self, primary: Arc<dyn PageReader>) -> Self {
-        self.primary = primary;
-        self
-    }
-
-    /// Replace the JS-rendering fallback. Pass `None` to disable.
-    pub fn with_js_fallback(mut self, fallback: Option<Arc<dyn PageReader>>) -> Self {
-        self.js_fallback = fallback;
-        self
-    }
-
-    /// Replace the archive fallback. Pass `None` to disable.
-    pub fn with_archive_fallback(mut self, fallback: Option<Arc<dyn PageReader>>) -> Self {
-        self.archive_fallback = fallback;
-        self
-    }
 }
 
 impl Default for HybridReader {

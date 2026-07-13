@@ -103,14 +103,6 @@ pub struct CalendarEvent {
     pub ical_uid: Option<String>,
 }
 
-/// Tracks which reminders have already been fired.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FiredReminder {
-    pub event_id: String,
-    pub reminder_minutes: i64,
-    pub fired_at: String,
-}
-
 /// Base tables only. Indexes that reference the remote-source columns
 /// are created in a separate step AFTER the ALTER TABLE migrations run,
 /// so existing databases (created before those columns existed) don't
@@ -503,42 +495,6 @@ impl CalendarStore {
             let mut events = Vec::new();
             for row in rows {
                 events.push(row.map_err(|e| AthenError::Other(format!("Read event row: {e}")))?);
-            }
-            Ok(events)
-        })
-        .await
-        .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
-    }
-
-    /// Get events starting within the next N minutes from now.
-    pub async fn get_upcoming_events(&self, within_minutes: i64) -> Result<Vec<CalendarEvent>> {
-        let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || {
-            let conn = conn.blocking_lock();
-            let now = Utc::now().to_rfc3339();
-            let future = (Utc::now() + chrono::Duration::minutes(within_minutes)).to_rfc3339();
-
-            let mut stmt = conn
-                .prepare(
-                    "SELECT id, title, description, start_time, end_time, all_day, \
-                     location, recurrence, reminder_minutes, color, category, \
-                     created_by, arc_id, created_at, updated_at, \
-                     source_id, remote_id, remote_etag, ical_uid \
-                     FROM calendar_events \
-                     WHERE datetime(start_time) >= datetime(?1) AND datetime(start_time) <= datetime(?2) \
-                     ORDER BY start_time ASC",
-                )
-                .map_err(|e| AthenError::Other(format!("Prepare upcoming events: {e}")))?;
-
-            let rows = stmt
-                .query_map(params![now, future], row_to_event)
-                .map_err(|e| AthenError::Other(format!("Query upcoming events: {e}")))?;
-
-            let mut events = Vec::new();
-            for row in rows {
-                events.push(
-                    row.map_err(|e| AthenError::Other(format!("Read event row: {e}")))?,
-                );
             }
             Ok(events)
         })

@@ -41,8 +41,6 @@ pub struct ProactiveHint {
 pub struct HintContext {
     pub config: AthenConfig,
     pub calendar_source_count: usize,
-    #[allow(dead_code)]
-    pub active_provider_id: String,
     pub is_local_provider: bool,
 }
 
@@ -246,7 +244,6 @@ mod tests {
         HintContext {
             config: AthenConfig::default(),
             calendar_source_count: 0,
-            active_provider_id: "deepseek".into(),
             is_local_provider: false,
         }
     }
@@ -275,7 +272,6 @@ mod tests {
         let ctx = HintContext {
             config,
             calendar_source_count: 3,
-            active_provider_id: "deepseek".into(),
             is_local_provider: false,
         };
         let hints = evaluate_rules(&ctx);
@@ -287,7 +283,6 @@ mod tests {
         let ctx = HintContext {
             config: AthenConfig::default(),
             calendar_source_count: 5,
-            active_provider_id: "ollama".into(),
             is_local_provider: true,
         };
         let hints = evaluate_rules(&ctx);
@@ -302,7 +297,6 @@ mod tests {
         let ctx = HintContext {
             config,
             calendar_source_count: 0,
-            active_provider_id: "deepseek".into(),
             is_local_provider: false,
         };
         let hints = evaluate_rules(&ctx);
@@ -317,7 +311,6 @@ mod tests {
         let ctx = HintContext {
             config,
             calendar_source_count: 0,
-            active_provider_id: "deepseek".into(),
             is_local_provider: false,
         };
         let hints = evaluate_rules(&ctx);

@@ -91,6 +91,9 @@ fn datetime_to_str(dt: DateTime<Utc>) -> String {
     dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
+// Only reached through the test-only `parse_dt` wrapper; `read_wakeup_row`
+// parses its timestamp columns inline via `parse_from_rfc3339`.
+#[cfg(test)]
 fn parse_datetime(s: &str) -> Result<DateTime<Utc>> {
     chrono::DateTime::parse_from_rfc3339(s)
         .map(|d| d.with_timezone(&Utc))
@@ -390,8 +393,9 @@ fn insert_or_replace(conn: &Connection, w: &Wakeup) -> Result<()> {
     Ok(())
 }
 
-// Re-export for tests so callers don't need to depend on chrono parsing.
-#[allow(dead_code)]
+// Test-only wrapper so tests don't need to depend on chrono parsing;
+// the tests module below is its only caller.
+#[cfg(test)]
 pub(crate) fn parse_dt(s: &str) -> Result<DateTime<Utc>> {
     parse_datetime(s)
 }

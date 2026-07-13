@@ -1429,7 +1429,6 @@ impl DefaultExecutor {
 /// content, and any tool calls extracted from SSE chunks.
 struct StreamResult {
     content: String,
-    #[allow(dead_code)]
     thinking: String,
     tool_calls: Vec<athen_core::llm::ToolCall>,
     /// Real token usage for the streamed turn, collected from the terminal

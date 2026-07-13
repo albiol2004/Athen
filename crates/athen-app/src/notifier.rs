@@ -900,11 +900,6 @@ mod tests {
             }
         }
 
-        #[allow(dead_code)]
-        fn send_count(&self) -> usize {
-            self.send_count.load(Ordering::Relaxed)
-        }
-
         fn set_should_fail(&self, fail: bool) {
             self.should_fail.store(fail, Ordering::Relaxed);
         }

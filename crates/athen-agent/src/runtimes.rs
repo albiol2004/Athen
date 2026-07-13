@@ -230,12 +230,6 @@ pub fn is_portable_python_installed() -> bool {
         .unwrap_or(false)
 }
 
-pub fn is_portable_node_installed() -> bool {
-    paths::athen_portable_node_bin()
-        .map(|p| p.exists())
-        .unwrap_or(false)
-}
-
 // ─── Manifest IO ─────────────────────────────────────────────────────
 
 fn manifest_path() -> Option<PathBuf> {

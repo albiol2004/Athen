@@ -146,19 +146,6 @@ pub fn athen_portable_node_dir() -> Option<PathBuf> {
     athen_runtimes_dir().map(|d| d.join("node"))
 }
 
-/// Where the portable `node` binary lives.
-pub fn athen_portable_node_bin() -> Option<PathBuf> {
-    let root = athen_portable_node_dir()?;
-    #[cfg(target_os = "windows")]
-    {
-        Some(root.join("node.exe"))
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        Some(root.join("bin").join("node"))
-    }
-}
-
 /// Directory containing portable Node binaries (node, npm, npx).
 pub fn athen_portable_node_bin_dir() -> Option<PathBuf> {
     let root = athen_portable_node_dir()?;

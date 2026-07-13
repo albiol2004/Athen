@@ -267,6 +267,7 @@ struct EmbeddingRequest {
 #[derive(Debug, Deserialize)]
 struct EmbeddingResponse {
     data: Vec<EmbeddingData>,
+    // model/usage mirror the API payload for completeness; only data is read.
     #[allow(dead_code)]
     model: String,
     #[allow(dead_code)]
@@ -281,6 +282,7 @@ struct EmbeddingData {
 
 #[derive(Debug, Deserialize)]
 struct EmbeddingUsage {
+    // Deserialized but currently unread; kept so the usage shape is documented.
     #[allow(dead_code)]
     prompt_tokens: u32,
     #[allow(dead_code)]

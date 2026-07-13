@@ -836,13 +836,6 @@ function registerTauriEventListeners() {
     });
 }
 
-// Tiny escape for selector matching; CSS.escape is well-supported in WebKit
-// but we keep a fallback for any embedded view that's pre-2019.
-function cssEscape(value) {
-    if (window.CSS && typeof window.CSS.escape === 'function') return window.CSS.escape(value);
-    return String(value).replace(/["\\]/g, '\\$&');
-}
-
 // Route `<a target="_blank">` and any external http(s) anchor through the
 // Tauri opener plugin so clicks actually reach the system browser. The
 // WebView doesn't honor `target="_blank"` for navigation, so without this
@@ -3038,12 +3031,6 @@ function renderInline(text) {
     // Links
     text = text.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
     return text;
-}
-
-function escapeHtml(text) {
-    const div = document.createElement('div');
-    div.textContent = text;
-    return div.innerHTML;
 }
 
 // ─── Time Formatting ───
@@ -5334,15 +5321,6 @@ function renderPill(text, kind) {
     return span;
 }
 
-// Convenience: arrange a vertical list of cards (events, contacts,
-// search hits) inside a scrollable panel.
-function renderRowsList(rows) {
-    const wrap = document.createElement('div');
-    wrap.className = 'tool-body-rows';
-    for (const r of rows) wrap.appendChild(r);
-    return wrap;
-}
-
 // Format an ISO/RFC3339 string in local time. Returns the input
 // unchanged if parsing fails — better than swallowing the value.
 function fmtDateTime(s) {
@@ -6637,14 +6615,6 @@ function addEmailEntry(content, meta) {
     messagesEl.appendChild(row);
 }
 
-function addSystemEntry(content, type) {
-    const row = document.createElement('div');
-    row.className = 'message-row system';
-    const icon = type === 'tool' ? '&#128295;' : '&#9881;';
-    row.innerHTML = '<div class="system-inline-entry">' + icon + ' ' + escapeHtml(content) + '</div>';
-    messagesEl.appendChild(row);
-}
-
 // Compact inline note for the post-rewind LLM hint (Message+source=system).
 // The same text rides into the next LLM turn wrapped in <system-reminder>
 // framing, so showing it to the user is non-load-bearing — purely a
@@ -7260,12 +7230,6 @@ function deepResearchInlineEl() {
 function removeDeepResearchInline() {
     const el = deepResearchInlineEl();
     if (el) el.remove();
-}
-
-// Back-compat shim retained for switchArc: the inline card is rebuilt from
-// run state, so removing the DOM node is all that's needed here.
-function clearDeepResearchBanner() {
-    removeDeepResearchInline();
 }
 
 // Builds the four-step phase ticker. `current` is the active phase key;
@@ -8427,19 +8391,6 @@ function reportRewindOutcome(outcome) {
     const summary = parts.length ? parts.join(', ') : 'nothing to change on disk';
     const label = discarded > 1 ? `Reverted ${discarded} changes` : 'Reverted';
     showToast(`${label}: ${summary}`, failed ? 'error' : 'success');
-}
-
-function formatRelativeTime(iso) {
-    if (!iso) return '';
-    const t = Date.parse(iso);
-    if (Number.isNaN(t)) return iso;
-    const delta = Date.now() - t;
-    if (delta < 60_000) return 'just now';
-    if (delta < 3_600_000) return `${Math.floor(delta / 60_000)}m ago`;
-    if (delta < 86_400_000) return `${Math.floor(delta / 3_600_000)}h ago`;
-    const days = Math.floor(delta / 86_400_000);
-    if (days < 7) return `${days}d ago`;
-    return new Date(t).toLocaleDateString();
 }
 
 const sidebarNewChatBtn = document.getElementById('sidebar-new-chat-btn');
@@ -14535,10 +14486,6 @@ function showTlTooltip(event, text) {
 function hideTlTooltip() {
     const tooltip = document.getElementById('tl-tooltip');
     if (tooltip) tooltip.style.display = 'none';
-}
-
-function escapeAttr(s) {
-    return s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 function formatTimelineTime(timestamp) {

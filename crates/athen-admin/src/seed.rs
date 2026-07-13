@@ -337,6 +337,7 @@ mod tests {
     // verify that the generated TOML parses and contains the right keys.
 
     #[derive(Debug, Deserialize)]
+    // Fields are asserted by deserialization succeeding, not read directly.
     #[allow(dead_code)]
     struct ProviderSurface {
         auth: toml::Value,
@@ -362,6 +363,7 @@ mod tests {
     }
 
     #[derive(Debug, Deserialize)]
+    // profiles/assignments are asserted via deserialization, not read directly.
     #[allow(dead_code)]
     struct ModelsConfigSurface {
         #[serde(default)]

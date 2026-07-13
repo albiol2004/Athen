@@ -3012,7 +3012,6 @@ impl AppState {
                 let ctx = crate::proactive_hints::HintContext {
                     config: config_snapshot.clone(),
                     calendar_source_count: cal_count,
-                    active_provider_id: active_id.clone(),
                     is_local_provider: is_local,
                 };
 

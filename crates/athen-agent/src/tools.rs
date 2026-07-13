@@ -1077,14 +1077,6 @@ impl ShellToolRegistry {
         self
     }
 
-    /// `Option`-flavoured variant — see [`Self::with_email_sender_opt`].
-    pub fn with_email_approval_opt(self, gate: Option<Arc<dyn EmailSendApprovalGate>>) -> Self {
-        match gate {
-            Some(g) => self.with_email_approval(g),
-            None => self,
-        }
-    }
-
     /// Inject the owner-destination check so `email_send` can skip the
     /// approval gate when the user is mailing themselves. Without this,
     /// every send goes through the gate — preserving today's behaviour.
@@ -1125,17 +1117,6 @@ impl ShellToolRegistry {
         self
     }
 
-    /// `Option`-flavoured variant — see [`Self::with_telegram_approval`].
-    pub fn with_telegram_approval_opt(
-        self,
-        gate: Option<Arc<dyn TelegramSendApprovalGate>>,
-    ) -> Self {
-        match gate {
-            Some(g) => self.with_telegram_approval(g),
-            None => self,
-        }
-    }
-
     /// Inject a post-send recorder that gets notified after every
     /// successful `send_telegram`. Used by the composition root to stamp
     /// the cross-channel arc-routing hint with the registry's arc id.
@@ -1145,17 +1126,6 @@ impl ShellToolRegistry {
     ) -> Self {
         self.telegram_outbound_recorder = Some(recorder);
         self
-    }
-
-    /// `Option`-flavoured variant — see [`Self::with_telegram_outbound_recorder`].
-    pub fn with_telegram_outbound_recorder_opt(
-        self,
-        recorder: Option<Arc<dyn TelegramOutboundRecorder>>,
-    ) -> Self {
-        match recorder {
-            Some(r) => self.with_telegram_outbound_recorder(r),
-            None => self,
-        }
     }
 
     /// Replace the default DuckDuckGo search backend (e.g. with Tavily).

@@ -86,26 +86,6 @@ impl ContainerExecutor {
         self.runtime
     }
 
-    /// Pull an image to ensure it is available locally.
-    pub async fn pull_image(&self, image: &str) -> Result<()> {
-        debug!(runtime = ?self.runtime, image, "Pulling container image");
-        let mut cmd = Command::new(self.runtime.binary());
-        hide_console(&mut cmd);
-        let output = cmd
-            .args(["pull", image])
-            .output()
-            .await
-            .map_err(|e| AthenError::Sandbox(format!("Failed to pull image: {e}")))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(AthenError::Sandbox(format!(
-                "Failed to pull image {image}: {stderr}"
-            )));
-        }
-        Ok(())
-    }
-
     /// Build the argument list for a container run command.
     /// This is public for testability.
     #[allow(clippy::too_many_arguments)]

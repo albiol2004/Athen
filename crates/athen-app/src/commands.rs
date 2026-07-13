@@ -3666,10 +3666,6 @@ pub(crate) struct ApprovedTaskOutcome {
     /// stashed `pending_message` or the task description). Useful for
     /// callers that want to mutate UI history.
     pub message: String,
-    /// The chat-history snapshot fed into the executor, including any
-    /// memory injection. Callers use this to drive `reinforce_used_memories`.
-    #[allow(dead_code)]
-    pub context_snapshot: Vec<ChatMessage>,
     /// Tools the agent actually ran. The Telegram-reply path uses this to
     /// build the "Tools used: …" footer.
     pub tool_log: ToolLog,
@@ -3910,7 +3906,6 @@ pub(crate) async fn execute_approved_task(
                 success: false,
                 domain: approved_task.domain.clone(),
                 message,
-                context_snapshot: vec![],
                 tool_log: new_tool_log(),
             }));
         }
@@ -4622,7 +4617,6 @@ pub(crate) async fn execute_approved_task(
                 success: false,
                 domain: approved_task.domain.clone(),
                 message,
-                context_snapshot,
                 tool_log,
             }));
         }
@@ -4780,7 +4774,6 @@ pub(crate) async fn execute_approved_task(
         success: result.success,
         domain: approved_task.domain.clone(),
         message,
-        context_snapshot,
         tool_log,
     }))
 }
@@ -5798,7 +5791,6 @@ pub(crate) async fn execute_dispatched_task(
                 success: false,
                 domain: task.domain.clone(),
                 message,
-                context_snapshot,
                 tool_log,
             }));
         }
@@ -5995,7 +5987,6 @@ pub(crate) async fn execute_dispatched_task(
         success: result.success,
         domain: task.domain.clone(),
         message,
-        context_snapshot,
         tool_log,
     }))
 }

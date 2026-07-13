@@ -5,7 +5,6 @@ edition = "2021"
 
 [dependencies]
 athen-core = { workspace = true }
-athen-ipc = { workspace = true }
 athen-shell = { workspace = true }
 athen-sandbox = { workspace = true }
 athen-risk = { workspace = true }
@@ -17,7 +16,7 @@ tracing = { workspace = true }
 async-trait = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
-futures = "0.3"
+futures = { workspace = true }
 tokio-stream = { workspace = true }
 blake3 = "1"
 reqwest = { workspace = true }

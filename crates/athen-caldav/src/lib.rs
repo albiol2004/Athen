@@ -267,35 +267,6 @@ impl CalendarSource for CalDavSource {
     }
 }
 
-/// Provider presets so the Settings UI can pre-fill `base_url` once the
-/// user picks "iCloud" vs "Google" vs "Fastmail" vs "Custom".
-pub mod presets {
-    /// Apple iCloud Calendar.
-    /// Username: full Apple ID email. Password: app-specific password
-    /// from appleid.apple.com → Sign-In and Security → App-Specific Passwords.
-    pub const ICLOUD: &str = "https://caldav.icloud.com/";
-
-    /// Google Calendar via CalDAV. The path includes the user's email.
-    /// Athen substitutes `{email}` at config time.
-    /// Username: full Gmail address. Password: 16-character app password
-    /// from myaccount.google.com → Security → 2-Step Verification → App Passwords.
-    pub const GOOGLE_TEMPLATE: &str =
-        "https://apidata.googleusercontent.com/caldav/v2/{email}/events/";
-
-    /// Fastmail. Username: full Fastmail address. Password: app password
-    /// from fastmail.com → Settings → Privacy & Security → Integrations.
-    pub const FASTMAIL: &str = "https://caldav.fastmail.com/";
-
-    /// Yandex. Username: full Yandex address. Password: app password.
-    pub const YANDEX: &str = "https://caldav.yandex.com/";
-
-    /// Nextcloud — server-specific. User must paste their server URL;
-    /// the canonical path is `/remote.php/dav/calendars/<user>/`.
-    /// Stored as a hint string, not a complete URL.
-    pub const NEXTCLOUD_HINT: &str =
-        "https://your-nextcloud.example.com/remote.php/dav/calendars/<user>/";
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
