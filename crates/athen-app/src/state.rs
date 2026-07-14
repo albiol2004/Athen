@@ -1144,15 +1144,9 @@ pub(crate) fn build_subagent_factories(
             // Sub-agents never get the deep_research / start_loop / see_image
             // tools (no runner) — keeps the bare worker registry bare and
             // prevents recursive runs.
-            let base = assemble_base_app_tool_registry(
-                deps,
-                &sub_arc,
-                Some(ui.clone()),
-                None,
-                None,
-                None,
-            )
-            .await;
+            let base =
+                assemble_base_app_tool_registry(deps, &sub_arc, Some(ui.clone()), None, None, None)
+                    .await;
             Box::new(crate::delegation::ArcRegistryAdapter(base))
                 as Box<dyn athen_core::traits::tool::ToolRegistry>
         })
@@ -1542,23 +1536,25 @@ pub(crate) async fn assemble_app_tool_registry(
             (Some(bridge), true, false) => {
                 let ui = bridge.clone();
                 let arc_id = arc_id.to_string();
-                Some(std::sync::Arc::new(move |image_index: i64, question: String| {
-                    let ui = ui.clone();
-                    let arc_id = arc_id.clone();
-                    Box::pin(async move {
-                        run_see_image(ui, arc_id, image_index, question).await
-                    })
-                        as std::pin::Pin<
-                            Box<
-                                dyn std::future::Future<
-                                        Output = std::result::Result<
-                                            crate::app_tools::SeeImageOutcome,
-                                            String,
-                                        >,
-                                    > + Send,
-                            >,
-                        >
-                }) as crate::app_tools::SeeImageRunner)
+                Some(
+                    std::sync::Arc::new(move |image_index: i64, question: String| {
+                        let ui = ui.clone();
+                        let arc_id = arc_id.clone();
+                        Box::pin(
+                            async move { run_see_image(ui, arc_id, image_index, question).await },
+                        )
+                            as std::pin::Pin<
+                                Box<
+                                    dyn std::future::Future<
+                                            Output = std::result::Result<
+                                                crate::app_tools::SeeImageOutcome,
+                                                String,
+                                            >,
+                                        > + Send,
+                                >,
+                            >
+                    }) as crate::app_tools::SeeImageRunner,
+                )
             }
             _ => None,
         }
@@ -4603,7 +4599,9 @@ impl AppState {
                                         };
                                         let reason = match &outcome {
                                             Err(e) => e.clone(),
-                                            Ok(Some(o)) if !o.content.is_empty() => o.content.clone(),
+                                            Ok(Some(o)) if !o.content.is_empty() => {
+                                                o.content.clone()
+                                            }
                                             _ => "The wake-up task did not complete successfully."
                                                 .to_string(),
                                         };
@@ -6725,15 +6723,13 @@ async fn run_see_image(
 
     // Re-surface the arc's attached images from the latest sense event.
     let attachment_store_opt = state.attachment_store();
-    let (Some(arc_store), Some(astore)) =
-        (state.arc_store.as_ref(), attachment_store_opt.as_ref())
+    let (Some(arc_store), Some(astore)) = (state.arc_store.as_ref(), attachment_store_opt.as_ref())
     else {
         return Ok(SeeImageOutcome::NoImage(
             "Image storage isn't available in this context.".to_string(),
         ));
     };
-    let Some(event_id) =
-        crate::commands::latest_sense_event_id_in_arc(arc_store, &arc_id).await
+    let Some(event_id) = crate::commands::latest_sense_event_id_in_arc(arc_store, &arc_id).await
     else {
         return Ok(SeeImageOutcome::NoImage(
             "No attached image was found in this conversation.".to_string(),
@@ -8468,12 +8464,9 @@ mod boot_gate_tests {
     async fn returns_immediately_when_already_ready() {
         let ready = Arc::new(AtomicBool::new(true));
         let signal = Arc::new(tokio::sync::Notify::new());
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            await_stack_ready(&ready, &signal),
-        )
-        .await
-        .expect("gate must not block when already ready");
+        tokio::time::timeout(Duration::from_secs(1), await_stack_ready(&ready, &signal))
+            .await
+            .expect("gate must not block when already ready");
     }
 
     // Not-ready: the gate parks until `mark_stack_ready`'s store + notify
@@ -8514,12 +8507,9 @@ mod boot_gate_tests {
         // Now flip readiness and run the gate: it must observe readiness (the
         // stored permit guarantees the await would wake even if it didn't).
         ready.store(true, Ordering::Release);
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            await_stack_ready(&ready, &signal),
-        )
-        .await
-        .expect("a release delivered before the waiter registers must not hang the gate");
+        tokio::time::timeout(Duration::from_secs(1), await_stack_ready(&ready, &signal))
+            .await
+            .expect("a release delivered before the waiter registers must not hang the gate");
     }
 }
 

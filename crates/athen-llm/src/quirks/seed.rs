@@ -293,13 +293,13 @@ pub fn quirks_for_family(family: ModelFamily) -> ModelQuirks {
 pub fn family_supports_vision(family: ModelFamily) -> Option<bool> {
     match family {
         // Vision-capable frontier families.
-        ModelFamily::ClaudeOpus47
-        | ModelFamily::ClaudeSonnet46
-        | ModelFamily::ClaudeHaiku45 => Some(true), // Claude 4.x is multimodal.
+        ModelFamily::ClaudeOpus47 | ModelFamily::ClaudeSonnet46 | ModelFamily::ClaudeHaiku45 => {
+            Some(true)
+        } // Claude 4.x is multimodal.
         ModelFamily::Gpt5 | ModelFamily::OpenAiO3 => Some(true), // GPT-5 line / o-series see images.
         ModelFamily::Gemini3Pro | ModelFamily::Gemini3Flash => Some(true), // Gemini 3.x multimodal.
-        ModelFamily::MiniMaxM3Cloud => Some(true), // MiniMax M3 accepts image input.
-        ModelFamily::Grok4 | ModelFamily::Grok45 => Some(true), // Grok 4.x is multimodal.
+        ModelFamily::MiniMaxM3Cloud => Some(true),               // MiniMax M3 accepts image input.
+        ModelFamily::Grok4 | ModelFamily::Grok45 => Some(true),  // Grok 4.x is multimodal.
         // The Llama 3.2 / Llama 4 families are heterogeneous — they span
         // vision checkpoints (3.2 90B-Vision, Llama 4 Scout/Maverick) AND
         // text-only ones (3.2 1B/3B). A curated verdict here would override
@@ -310,21 +310,21 @@ pub fn family_supports_vision(family: ModelFamily) -> Option<bool> {
         ModelFamily::Llama32Instruct | ModelFamily::Llama4Instruct => None,
 
         // Known text-only families.
-        ModelFamily::DeepSeekV4Chat
-        | ModelFamily::DeepSeekV4Pro
-        | ModelFamily::DeepSeekR1 => Some(false),
-        ModelFamily::Qwen35Local
-        | ModelFamily::Qwen36Local
-        | ModelFamily::Qwen3CoderNext => Some(false),
+        ModelFamily::DeepSeekV4Chat | ModelFamily::DeepSeekV4Pro | ModelFamily::DeepSeekR1 => {
+            Some(false)
+        }
+        ModelFamily::Qwen35Local | ModelFamily::Qwen36Local | ModelFamily::Qwen3CoderNext => {
+            Some(false)
+        }
         ModelFamily::KimiK26Cloud | ModelFamily::KimiK27Code => Some(false),
         ModelFamily::MiniMaxM25Cloud | ModelFamily::MiniMaxM27Cloud => Some(false),
         ModelFamily::Glm52 => Some(false), // glm-5.2 is text-focused.
-        ModelFamily::Codestral2508
-        | ModelFamily::MistralLarge3
-        | ModelFamily::MagistralMedium => Some(false),
+        ModelFamily::Codestral2508 | ModelFamily::MistralLarge3 | ModelFamily::MagistralMedium => {
+            Some(false)
+        }
         ModelFamily::Llama33Instruct => Some(false), // Llama 3.3 70B is text-only.
-        ModelFamily::Gemma4Local => Some(false), // local Gemma text-only in our profile.
-        ModelFamily::Lfm25Local => Some(false), // on-device text-only.
+        ModelFamily::Gemma4Local => Some(false),     // local Gemma text-only in our profile.
+        ModelFamily::Lfm25Local => Some(false),      // on-device text-only.
 
         // Unknown / generic — defer to the per-Connection checkbox.
         ModelFamily::Default => None,
@@ -401,11 +401,7 @@ const BUILTIN_SLUG_QUIRKS: &[(&str, &str, ModelFamily)] = &[
     ("google", "gemini-3.0-flash*", ModelFamily::Gemini3Flash),
     // MiniMax Token Plan: M3 (newest), then M2.7 before the M2.5 wildcard
     // (first-match-wins; distinct slug prefixes so order is also unambiguous).
-    (
-        "minimax",
-        "minimax-m3*",
-        ModelFamily::MiniMaxM3Cloud,
-    ),
+    ("minimax", "minimax-m3*", ModelFamily::MiniMaxM3Cloud),
     (
         "minimax_anthropic",
         "minimax-m3*",
@@ -570,8 +566,14 @@ mod tests {
             Some(false)
         );
         assert_eq!(family_supports_vision(ModelFamily::Glm52), Some(false));
-        assert_eq!(family_supports_vision(ModelFamily::KimiK27Code), Some(false));
-        assert_eq!(family_supports_vision(ModelFamily::Qwen35Local), Some(false));
+        assert_eq!(
+            family_supports_vision(ModelFamily::KimiK27Code),
+            Some(false)
+        );
+        assert_eq!(
+            family_supports_vision(ModelFamily::Qwen35Local),
+            Some(false)
+        );
         // Unknown / generic defers to the per-Connection flag.
         assert_eq!(family_supports_vision(ModelFamily::Default), None);
         // Total over every variant (no panic; match is exhaustive).

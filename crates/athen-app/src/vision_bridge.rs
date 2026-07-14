@@ -104,19 +104,25 @@ pub(crate) async fn prepare_images_for_vision(
     let mut injected = String::new();
     for (idx, image) in images.iter().enumerate() {
         let image_index = idx as i64;
-        let description =
-            resolve_description(&*vision_provider, arc_store, arc_id, entry_id, image_index, image)
-                .await
-                .unwrap_or_else(|| {
-                    notify(
-                        ui,
-                        arc_id,
-                        "Couldn't read an image",
-                        "The Vision model failed to describe an attached image. The text-only \
+        let description = resolve_description(
+            &*vision_provider,
+            arc_store,
+            arc_id,
+            entry_id,
+            image_index,
+            image,
+        )
+        .await
+        .unwrap_or_else(|| {
+            notify(
+                ui,
+                arc_id,
+                "Couldn't read an image",
+                "The Vision model failed to describe an attached image. The text-only \
                          model will proceed without it.",
-                    );
-                    "(vision model failed to describe this image)".to_string()
-                });
+            );
+            "(vision model failed to describe this image)".to_string()
+        });
         injected.push('\n');
         injected.push_str("[image: ");
         injected.push_str(&description);
@@ -172,7 +178,11 @@ async fn resolve_description(
             Some(d)
         }
         Ok(_) => {
-            tracing::warn!(arc_id, image_index, "vision model returned an empty description");
+            tracing::warn!(
+                arc_id,
+                image_index,
+                "vision model returned an empty description"
+            );
             Some("(vision model returned an empty description)".to_string())
         }
         Err(e) => {

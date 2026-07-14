@@ -44,7 +44,6 @@ impl HybridReader {
             archive_fallback: Some(Arc::new(WaybackReader::new())),
         }
     }
-
 }
 
 impl Default for HybridReader {

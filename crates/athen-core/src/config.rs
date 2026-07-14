@@ -826,7 +826,6 @@ impl BundledTier {
             BundledTier::HighQuality => 1200,
         }
     }
-
 }
 
 /// How the embedding provider is selected.

@@ -884,10 +884,7 @@ pub(crate) fn curated_models(id: &str) -> &'static [(&'static str, &'static str)
             ("minimax-m2.7", "MiniMax M2.7 (legacy)"),
             ("minimax-m2.5", "MiniMax M2.5 (legacy)"),
         ],
-        "xai" => &[
-            ("grok-4.5", "Grok 4.5"),
-            ("grok-4", "Grok 4 (legacy)"),
-        ],
+        "xai" => &[("grok-4.5", "Grok 4.5"), ("grok-4", "Grok 4 (legacy)")],
         "kimi" => &[
             ("kimi-k2.7-code", "Kimi K2.7 Code"),
             ("kimi-k2.6", "Kimi K2.6"),
@@ -1507,12 +1504,13 @@ pub(crate) async fn get_settings_core(
                         connection_id: t.connection_id.clone(),
                         slug: t.slug.clone(),
                     }),
-                vision: b.vision.as_ref().map(|t| {
-                    crate::bundle_settings::BundleTierView {
+                vision: b
+                    .vision
+                    .as_ref()
+                    .map(|t| crate::bundle_settings::BundleTierView {
                         connection_id: t.connection_id.clone(),
                         slug: t.slug.clone(),
-                    }
-                }),
+                    }),
             };
             crate::bundle_settings::BundleView {
                 is_active: id == active_bundle_id,
