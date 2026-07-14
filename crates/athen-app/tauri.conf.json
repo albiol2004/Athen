@@ -1,6 +1,6 @@
 {
     "productName": "Athen",
-    "version": "0.5.3",
+    "version": "0.6.0",
     "identifier": "com.athen.app",
     "build": {
         "frontendDist": "../../frontend"
