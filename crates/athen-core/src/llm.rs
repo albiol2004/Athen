@@ -283,6 +283,19 @@ pub enum ModelFamily {
     /// xAI Grok 4 (Grok 4.3 lineage). 1M context, OpenAI-compat structured
     /// tool calls, lenient template.
     Grok4,
+    /// xAI Grok 4.5 (2026). Same OpenAI-compat wire shape as Grok 4 —
+    /// reasoning hidden server-side, native structured tool calls. Distinct
+    /// variant only for a correct UI label; quirks are identical to `Grok4`.
+    Grok45,
+    /// Zhipu GLM-5.2 (open-weights, 2026-06). OpenAI-compat
+    /// `/v1/chat/completions` with native structured function calling and a
+    /// separate `reasoning_content` field. BEST-EFFORT profile pending live
+    /// API verification.
+    Glm52,
+    /// MiniMax M3 (2026-06). Served on both OpenAI-compat and native
+    /// Anthropic wires; interleaved `<think>` reasoning that must be echoed
+    /// back on every turn. BEST-EFFORT profile pending live API verification.
+    MiniMaxM3Cloud,
     /// Liquid AI LFM2.5-8B-A1B (on-device MoE, May 2026). Reasoning-only
     /// (`<think>` blocks) with *pythonic* tool calls delimited by
     /// `<|tool_call_start|>[func(arg='v', flag=True)]<|tool_call_end|>`.
@@ -323,6 +336,9 @@ impl ModelFamily {
             ModelFamily::DeepSeekV4Pro => "DeepSeek V4 Pro",
             ModelFamily::Qwen3CoderNext => "Qwen3-Coder Next",
             ModelFamily::Grok4 => "xAI Grok 4",
+            ModelFamily::Grok45 => "Grok 4.5",
+            ModelFamily::Glm52 => "GLM 5.2",
+            ModelFamily::MiniMaxM3Cloud => "MiniMax M3",
             ModelFamily::Lfm25Local => "Liquid LFM2.5-8B-A1B (local)",
         }
     }
@@ -358,6 +374,9 @@ impl ModelFamily {
             ModelFamily::DeepSeekV4Pro => "DeepSeekV4Pro",
             ModelFamily::Qwen3CoderNext => "Qwen3CoderNext",
             ModelFamily::Grok4 => "Grok4",
+            ModelFamily::Grok45 => "Grok45",
+            ModelFamily::Glm52 => "Glm52",
+            ModelFamily::MiniMaxM3Cloud => "MiniMaxM3Cloud",
             ModelFamily::Lfm25Local => "Lfm25Local",
         }
     }
@@ -398,6 +417,9 @@ impl ModelFamily {
             ModelFamily::DeepSeekV4Pro,
             ModelFamily::Qwen3CoderNext,
             ModelFamily::Grok4,
+            ModelFamily::Grok45,
+            ModelFamily::Glm52,
+            ModelFamily::MiniMaxM3Cloud,
             ModelFamily::Lfm25Local,
         ]
     }

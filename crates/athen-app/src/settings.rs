@@ -609,6 +609,9 @@ pub(crate) fn default_base_url(id: &str) -> &str {
         // adapter appends `/v1/messages`, yielding the documented
         // `api.kimi.com/coding/v1/messages`.
         "kimi_code" => "https://api.kimi.com/coding",
+        // xAI (Grok) — OpenAI-compatible API. Adapter appends
+        // `/v1/chat/completions` (via the OpenAiCompatibleProvider fallback).
+        "xai" => "https://api.x.ai",
         "ollama" => "http://localhost:11434",
         "llamacpp" => "http://localhost:8080",
         _ => "",
@@ -633,14 +636,16 @@ pub(crate) fn default_model(id: &str) -> &str {
         // on the $10 tier — the right default for an agent loop. Pro/Kimi/
         // Qwen are selectable from the model picker.
         "opencode_go" => "deepseek-v4-flash",
-        // MiniMax Token Plan: M2.7 is the newest flagship; Starter tier
-        // exposes only this model, higher tiers add the full lineup.
-        "minimax" | "minimax_anthropic" => "minimax-m2.7",
+        // MiniMax Token Plan: M3 is the newest flagship (2026-06); Starter
+        // tier exposes only this model, higher tiers add the full lineup.
+        "minimax" | "minimax_anthropic" => "minimax-m3",
         // Kimi K2.7 Code is the June 2026 coding flagship (256K ctx,
         // forced thinking) — the right default for an agent loop.
         "kimi" => "kimi-k2.7-code",
         // Code Plan keys only route the plan slug.
         "kimi_code" => "kimi-for-coding",
+        // xAI Grok 4.5 flagship (OpenAI-compat wire).
+        "xai" => "grok-4.5",
         "ollama" => "llama3",
         "llamacpp" => "default",
         _ => "",
@@ -661,6 +666,7 @@ fn display_name(id: &str) -> &str {
         "minimax_anthropic" => "MiniMax Token Plan (Anthropic-compat + prompt cache)",
         "kimi" => "Kimi (Moonshot platform)",
         "kimi_code" => "Kimi Code Plan (subscription, Anthropic-compat)",
+        "xai" => "xAI (Grok)",
         "ollama" => "Ollama",
         "llamacpp" => "llama.cpp",
         _ => id,
@@ -700,14 +706,15 @@ fn default_family(id: &str) -> &str {
         // per-slug. This default still drives the "+ Add Provider"
         // autofill UX.
         "opencode_go" => "DeepSeekV4Chat",
-        // MiniMax M2.7 — closest existing family is MiniMaxM25Cloud (same
-        // tool-call extraction shape). User can switch in the family
-        // dropdown if a more specific profile lands later.
-        "minimax" | "minimax_anthropic" => "MiniMaxM25Cloud",
+        // MiniMax M3 (2026-06) — the newest flagship profile. User can switch
+        // in the family dropdown if pointing at an older M2.x slug.
+        "minimax" | "minimax_anthropic" => "MiniMaxM3Cloud",
         // Both Kimi entries default to the K2.7 Code profile (forced
         // thinking, reasoning echo). Other platform slugs (kimi-k2.6,
         // kimi-k2-thinking) resolve per-slug via the quirks registry.
         "kimi" | "kimi_code" => "KimiK27Code",
+        // xAI Grok 4.5 (same wire shape as Grok 4).
+        "xai" => "Grok45",
         _ => "Default",
     }
 }
@@ -782,12 +789,10 @@ fn default_tier_slugs(id: &str) -> (&'static str, &'static str, &'static str, &'
             "deepseek-v4-pro",
             "deepseek-v4-pro",
         ),
-        "minimax" | "minimax_anthropic" => (
-            "minimax-m2.7",
-            "minimax-m2.7",
-            "minimax-m2.7",
-            "minimax-m2.7",
-        ),
+        "minimax" | "minimax_anthropic" => ("minimax-m3", "minimax-m3", "minimax-m3", "minimax-m3"),
+        // xAI serves one Grok flagship — every tier maps to it; users edit
+        // per-tier if xAI ships a cheaper mini SKU.
+        "xai" => ("grok-4.5", "grok-4.5", "grok-4.5", "grok-4.5"),
         // Moonshot platform: K2.6 covers the cheap/fast tiers; K2.7 Code
         // is the coding/agentic flagship for Code + Powerful.
         "kimi" => ("kimi-k2.6", "kimi-k2.6", "kimi-k2.7-code", "kimi-k2.7-code"),
@@ -868,13 +873,20 @@ pub(crate) fn curated_models(id: &str) -> &'static [(&'static str, &'static str)
             ("deepseek-v4-pro", "DeepSeek V4 Pro"),
             ("kimi-k2", "Kimi K2"),
             ("qwen3-coder-plus", "Qwen 3 Coder Plus"),
-            ("glm-4.6", "GLM 4.6"),
+            ("glm-5.2", "GLM 5.2"),
+            ("glm-4.6", "GLM 4.6 (legacy)"),
             ("mimo-7b", "MiMo 7B"),
+            ("minimax-m3", "MiniMax M3 (Anthropic wire)"),
             ("minimax-m2.7", "MiniMax M2.7 (Anthropic wire)"),
         ],
         "minimax" | "minimax_anthropic" => &[
-            ("minimax-m2.7", "MiniMax M2.7"),
+            ("minimax-m3", "MiniMax M3"),
+            ("minimax-m2.7", "MiniMax M2.7 (legacy)"),
             ("minimax-m2.5", "MiniMax M2.5 (legacy)"),
+        ],
+        "xai" => &[
+            ("grok-4.5", "Grok 4.5"),
+            ("grok-4", "Grok 4 (legacy)"),
         ],
         "kimi" => &[
             ("kimi-k2.7-code", "Kimi K2.7 Code"),
@@ -924,6 +936,7 @@ fn api_key_hint(id: &str) -> &str {
         // (distinct from their standard API keys, which are JWT-shaped).
         "minimax" | "minimax_anthropic" => "sk-cp-...",
         "deepseek" | "openai" | "mistral" | "opencode_go" | "kimi" | "kimi_code" => "sk-...",
+        "xai" => "xai-...",
         _ => "",
     }
 }
@@ -940,6 +953,7 @@ fn dashboard_url(id: &str) -> &'static str {
         "minimax" | "minimax_anthropic" => "https://platform.minimaxi.com/",
         "kimi" => "https://platform.moonshot.ai/console/api-keys",
         "kimi_code" => "https://www.kimi.com/code",
+        "xai" => "https://console.x.ai/",
         "ollama" => "https://ollama.com/",
         "llamacpp" => "https://github.com/ggml-org/llama.cpp",
         _ => "",
@@ -958,6 +972,7 @@ fn cost_note(id: &str) -> &'static str {
         "minimax" | "minimax_anthropic" => "Token plan — check MiniMax pricing page.",
         "kimi" => "Pay-as-you-go — K2.7 Code pricing on the Moonshot platform page.",
         "kimi_code" => "Kimi Code Plan subscription — usage included up to plan quota.",
+        "xai" => "Pay-as-you-go — check the xAI pricing page for Grok rates.",
         "ollama" | "llamacpp" => "Free — runs on your hardware.",
         _ => "",
     }
@@ -975,6 +990,7 @@ fn key_format_hint(id: &str) -> &'static str {
         "minimax" | "minimax_anthropic" => "Starts with \"sk-cp-\" (Token Plan coding key).",
         "kimi" => "Starts with \"sk-\" (Moonshot platform key).",
         "kimi_code" => "Created in the Kimi Code Console — shown once at creation.",
+        "xai" => "Starts with \"xai-\".",
         _ => "",
     }
 }
@@ -1027,6 +1043,12 @@ fn setup_steps(id: &str) -> &'static [&'static str] {
             "Subscribe to a Kimi Code plan at kimi.com/code.",
             "Open the Kimi Code Console and click \"Create API Key\".",
             "Copy the key — it is shown only once.",
+            "Paste the key into Athen's API Key field.",
+        ],
+        "xai" => &[
+            "Go to console.x.ai and sign up or log in.",
+            "Open API Keys and click \"Create API Key\".",
+            "Copy the key (starts with \"xai-\").",
             "Paste the key into Athen's API Key field.",
         ],
         "ollama" => &[
@@ -1106,6 +1128,7 @@ const PROVIDER_IDS: &[&str] = &[
     "minimax_anthropic",
     "kimi",
     "kimi_code",
+    "xai",
     "ollama",
     "llamacpp",
 ];

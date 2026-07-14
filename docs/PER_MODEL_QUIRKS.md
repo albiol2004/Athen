@@ -267,6 +267,9 @@ Last verified: **2026-05-19** (code audit: quirks/mod.rs reasoning_content fallb
 | `MagistralMedium` | Magistral Medium | `magistral-medium-latest` | Structured | InlineThinkTags | SystemAbsorbedIntoUser | — | — |
 | `Codestral2508` | Codestral 25.08 | `codestral-latest` | Structured | None | SystemAbsorbedIntoUser | — | — |
 | `Grok4` | xAI Grok 4 | `grok-4` | Structured | None | Lenient | — | — |
+| `Grok45` | Grok 4.5 | `grok-4.5` | Structured | None | Lenient | — | — |
+| `Glm52` [d] | GLM 5.2 | `glm-5.2` | Structured | SeparateField | Lenient | — | — |
+| `MiniMaxM3Cloud` [d] | MiniMax M3 | `minimax-m3` | Structured | InlineThinkTags | Lenient | — | echo_reasoning_on_tool_turn |
 | `Default` | _(fallback)_ | _whatever_ | Structured | None | Lenient | — | — |
 
 Notes:
@@ -283,6 +286,14 @@ Notes:
   `Structured` because the Ollama OpenAI-compat shim usually parses the
   special tokens before they reach us. Revisit if a user reports raw
   `<|tool_call>` markup leaking into responses.
+- **[d]** `Glm52` and `MiniMaxM3Cloud` are **BEST-EFFORT** profiles seeded
+  from vendor docs on 2026-07-14; the live APIs could not be reached from
+  the build sandbox. `Glm52` assumes the DeepSeek-V4 shape (OpenAI-compat +
+  separate `reasoning_content`); `MiniMaxM3Cloud` assumes the Claude
+  Sonnet-4 shape (`<think>` interleave + reasoning echoed back every turn).
+  **Verify `reasoning_content` / `<think>` handling and tool-call extraction
+  against the live GLM-5.2 and MiniMax-M3 APIs before relying on them.** Both
+  carry matching `BEST-EFFORT` comments in `quirks/seed.rs`.
 
 The `Default` row is the safety net: any provider whose user hasn't
 picked a family falls through to it and reproduces today's OpenAI-compat
@@ -312,7 +323,8 @@ field in Settings to opt in.
 
 | Model | Canonical slug | Maps to family | Notes |
 |---|---|---|---|
-| GPT-5.5 | `gpt-5.5` | `Gpt5` | Current default flagship (Apr 2026); 1M ctx |
+| GPT-5.6 | `gpt-5.6` | `Gpt5` | Newest (2026); same OpenAI wire — covered by the `gpt-5*` slug pattern, no new family |
+| GPT-5.5 | `gpt-5.5` | `Gpt5` | Flagship (Apr 2026); 1M ctx |
 | GPT-5.5 Pro | `gpt-5.5-pro` | `Gpt5` | Responses API only; extended compute |
 | GPT-5.4 | `gpt-5.4` | `Gpt5` | Lower cost frontier, enhanced vision |
 | GPT-5.4 Mini | `gpt-5.4-mini` | `Gpt5` | Production fast-path |
@@ -386,8 +398,12 @@ this is fine.
 |---|---|---|---|
 | Kimi K2.6 cloud | `kimi-k2-6` | `KimiK26Cloud` | `reasoning_content` field; preserve-thinking |
 | Kimi K2 Thinking | `kimi-k2-thinking` | `KimiK26Cloud` | Explicit thinking mode |
+| MiniMax M3 | `minimax-m3` | `MiniMaxM3Cloud` | **BEST-EFFORT** [d]; 428B MoE, multimodal; OpenAI + Anthropic wires; `<think>` interleave echoed every turn |
+| MiniMax M2.7 | `minimax-m2.7` | `MiniMaxM27Cloud` | Bracket-delimited tool calls |
 | MiniMax M2.5 | `minimax-m2-5` | `MiniMaxM25Cloud` | `<minimax:tool_call>` namespaced XML when not via vLLM |
+| GLM 5.2 (Zhipu, MIT) | `glm-5.2` | `Glm52` | **BEST-EFFORT** [d]; OpenAI-compat; separate `reasoning_content`; 1M ctx; via `opencode_go` / OpenRouter (`z-ai/glm-5.2`) |
 | Gemma 4 (Apache 2.0) | `gemma-4-27b-it` | `Gemma4Local` | Special-token tool format; verify on report |
+| xAI Grok 4.5 | `grok-4.5` | `Grok45` | 2026; identical wire to Grok 4; xAI preset (`https://api.x.ai`) |
 | xAI Grok 4 | `grok-4` | `Grok4` | 1M ctx; OpenAI-compat structured |
 | Yi-Lightning | `yi-lightning` | `Default` | OpenAI-compat baseline; no special quirks |
 | Nemotron 70B | `llama-3.1-nemotron-70b-instruct` | `Llama33Instruct` | Llama-3.1 base; reuse Llama family |

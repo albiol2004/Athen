@@ -47,6 +47,9 @@ pub fn default_slug_for_family(family: ModelFamily) -> &'static str {
         ModelFamily::DeepSeekV4Pro => "deepseek-v4-pro",
         ModelFamily::Qwen3CoderNext => "Qwen/Qwen3-Coder-Next",
         ModelFamily::Grok4 => "grok-4",
+        ModelFamily::Grok45 => "grok-4.5",
+        ModelFamily::Glm52 => "glm-5.2",
+        ModelFamily::MiniMaxM3Cloud => "minimax-m3",
         ModelFamily::Lfm25Local => "LiquidAI/LFM2.5-8B-A1B",
     }
 }
@@ -228,6 +231,38 @@ pub fn quirks_for_family(family: ModelFamily) -> ModelQuirks {
         // wire-level quirks vs the OpenAI-compat baseline.
         ModelFamily::Grok4 => ModelQuirks::default(),
 
+        // xAI Grok 4.5 (2026). Identical wire shape to Grok 4 — OpenAI-compat
+        // structured tool calls, reasoning hidden server-side, lenient
+        // template. Byte-identical behavior to the `Grok4` arm; the distinct
+        // family exists only for a correct UI label.
+        ModelFamily::Grok45 => ModelQuirks::default(),
+
+        // Zhipu GLM-5.2 (open-weights, 2026-06). OpenAI-compat with native
+        // structured function calling and chain-of-thought in a separate
+        // `reasoning_content` field (mirrors the DeepSeek-V4 profile: promote
+        // reasoning-only turns so they don't arrive empty). No reasoning
+        // echo-back required.
+        // BEST-EFFORT (vendor docs 2026-07-14): verify reasoning_content +
+        // tool-call shape against live GLM-5.2 API.
+        ModelFamily::Glm52 => ModelQuirks {
+            reasoning_surface: ReasoningSurface::SeparateField,
+            ..ModelQuirks::default()
+        },
+
+        // MiniMax M3 (2026-06). Served on both an OpenAI-compat and a native
+        // Anthropic wire; uses interleaved thinking inside `<think>` tags (the
+        // Claude Sonnet-4 pattern) and requires the reasoning be echoed back
+        // on every turn. Genuinely different from M2.5 (vendor-tagged XML) and
+        // M2.7 (bracket) tool-call formats.
+        // BEST-EFFORT (vendor docs 2026-07-14): verify tool-call extraction +
+        // <think> interleave against live MiniMax-M3 API (OpenAI + Anthropic
+        // wires).
+        ModelFamily::MiniMaxM3Cloud => ModelQuirks {
+            reasoning_surface: ReasoningSurface::InlineThinkTags,
+            echo_reasoning_on_tool_turn: true,
+            ..ModelQuirks::default()
+        },
+
         // Liquid LFM2.5-8B-A1B (on-device MoE, May 2026). Reasoning-only —
         // always emits `<think>` blocks (inline tags). Tool calls are
         // pythonic, delimited by `<|tool_call_start|>[...]<|tool_call_end|>`;
@@ -301,6 +336,9 @@ const BUILTIN_SLUG_QUIRKS: &[(&str, &str, ModelFamily)] = &[
         ModelFamily::ClaudeSonnet46,
     ),
     ("anthropic", "claude-haiku-4-5*", ModelFamily::ClaudeHaiku45),
+    // gpt-5.6 shares the OpenAI wire — explicit row for catalog clarity; the
+    // `gpt-5*` prefix below already covers it.
+    ("openai", "gpt-5.6*", ModelFamily::Gpt5),
     ("openai", "gpt-5*", ModelFamily::Gpt5),
     ("openai", "o3*", ModelFamily::OpenAiO3),
     ("openai", "o4-mini*", ModelFamily::OpenAiO3),
@@ -309,7 +347,18 @@ const BUILTIN_SLUG_QUIRKS: &[(&str, &str, ModelFamily)] = &[
     ("google", "gemini-3-pro*", ModelFamily::Gemini3Pro),
     ("google", "gemini-3-flash*", ModelFamily::Gemini3Flash),
     ("google", "gemini-3.0-flash*", ModelFamily::Gemini3Flash),
-    // M2.7 before the M2.5 wildcard (first-match-wins).
+    // MiniMax Token Plan: M3 (newest), then M2.7 before the M2.5 wildcard
+    // (first-match-wins; distinct slug prefixes so order is also unambiguous).
+    (
+        "minimax",
+        "minimax-m3*",
+        ModelFamily::MiniMaxM3Cloud,
+    ),
+    (
+        "minimax_anthropic",
+        "minimax-m3*",
+        ModelFamily::MiniMaxM3Cloud,
+    ),
     (
         "minimax_anthropic",
         "minimax-m2.7*",
@@ -320,6 +369,10 @@ const BUILTIN_SLUG_QUIRKS: &[(&str, &str, ModelFamily)] = &[
         "minimax-m2*",
         ModelFamily::MiniMaxM25Cloud,
     ),
+    // xAI (Grok): 4.5 BEFORE 4 — `grok-4.5*` would otherwise be swallowed by
+    // the `grok-4*` prefix (first-match-wins).
+    ("xai", "grok-4.5*", ModelFamily::Grok45),
+    ("xai", "grok-4*", ModelFamily::Grok4),
     // Kimi (Moonshot platform): K2.7 Code before the K2* wildcard
     // (first-match-wins).
     ("kimi", "kimi-k2.7*", ModelFamily::KimiK27Code),
@@ -341,12 +394,15 @@ const BUILTIN_SLUG_QUIRKS: &[(&str, &str, ModelFamily)] = &[
     ("opencode_go", "kimi-k2.7*", ModelFamily::KimiK27Code),
     ("opencode_go", "kimi-k2*", ModelFamily::KimiK26Cloud),
     ("opencode_go", "qwen3-coder*", ModelFamily::Qwen3CoderNext),
-    // M2.7 before the M2.5 wildcard (first-match-wins).
+    // GLM-5.2 now HAS a profiled family (glm-4.6 still does not — see below).
+    ("opencode_go", "glm-5.2*", ModelFamily::Glm52),
+    // MiniMax M3 (newest), then M2.7 before the M2.5 wildcard (first-match-wins).
+    ("opencode_go", "minimax-m3*", ModelFamily::MiniMaxM3Cloud),
     ("opencode_go", "minimax-m2.7*", ModelFamily::MiniMaxM27Cloud),
     ("opencode_go", "minimax-m2*", ModelFamily::MiniMaxM25Cloud),
     // glm-4.6 and mimo-7b have no profiled family yet — they fall through
     // to None and inherit the Connection's family (Default for opencode_go,
-    // which yields baseline quirks).
+    // which yields baseline quirks). glm-5.2 (above) is now profiled.
 
     // --- Cross-provider fallbacks ------------------------------------------
     // Any connection serving these well-known slugs (e.g. an OpenRouter
@@ -360,6 +416,18 @@ const BUILTIN_SLUG_QUIRKS: &[(&str, &str, ModelFamily)] = &[
     ("*", "gemini-3-pro*", ModelFamily::Gemini3Pro),
     ("*", "gemini-3-flash*", ModelFamily::Gemini3Flash),
     ("*", "gpt-5*", ModelFamily::Gpt5),
+    // xAI Grok via any relay (e.g. OpenRouter `x-ai/grok-*`). 4.5 BEFORE 4
+    // in each form — `grok-4.5*` is otherwise swallowed by `grok-4*`.
+    ("*", "grok-4.5*", ModelFamily::Grok45),
+    ("*", "grok-4*", ModelFamily::Grok4),
+    ("*", "x-ai/grok-4.5*", ModelFamily::Grok45),
+    ("*", "x-ai/grok-4*", ModelFamily::Grok4),
+    // GLM-5.2 via any relay (opencode_go handled above; OpenRouter uses the
+    // `z-ai/` vendor prefix).
+    ("*", "glm-5.2*", ModelFamily::Glm52),
+    ("*", "z-ai/glm-5.2*", ModelFamily::Glm52),
+    // MiniMax M3 via any relay.
+    ("*", "minimax-m3*", ModelFamily::MiniMaxM3Cloud),
     // Liquid LFM2.5 served locally — match the friendly slug, the no-dot
     // GGUF-filename form (`lfm25-8b-...`), and the HF repo id form so it
     // auto-profiles even if the user doesn't pick the family.
