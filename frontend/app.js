@@ -8774,7 +8774,20 @@ function enhanceSelect(sel) {
         const onDocClick = (e) => {
             if (popup && !popup.contains(e.target) && !trigger.contains(e.target)) closePopup(false);
         };
-        const onWinChange = () => closePopup(false);
+        // Close on BACKGROUND scroll/resize (the popup is position:fixed and
+        // would otherwise detach from its trigger). But the popup itself is a
+        // scroll container (max-height + overflow-y:auto): when it has enough
+        // options to overflow, setActive()'s scrollIntoView scrolls it, which
+        // fires a scroll event this capture-phase listener would catch and
+        // self-dismiss the popup one frame after opening. Ignore scrolls that
+        // originate inside the popup — only outside scrolls should close it.
+        const onWinChange = (e) => {
+            if (e && e.type === 'scroll' && popup &&
+                (e.target === popup || (e.target && e.target.nodeType === 1 && popup.contains(e.target)))) {
+                return;
+            }
+            closePopup(false);
+        };
         setTimeout(() => document.addEventListener('click', onDocClick, true), 0);
         window.addEventListener('resize', onWinChange);
         window.addEventListener('scroll', onWinChange, true);
