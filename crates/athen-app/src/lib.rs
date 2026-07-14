@@ -50,6 +50,7 @@ pub(crate) mod telephony_gate;
 pub(crate) mod tunnel;
 pub(crate) mod ui_bridge;
 pub(crate) mod vault_creds;
+pub(crate) mod vision_bridge;
 pub(crate) mod voice;
 mod wakeup_commands;
 pub(crate) mod wakeup_registry;

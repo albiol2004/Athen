@@ -1122,6 +1122,7 @@ mod tests {
             data: ImageData::Base64 {
                 data: "AAAA".into(),
             },
+            description: None,
         }];
         let parts = multimodal_parts("describe this", &images);
         assert_eq!(parts.len(), 2);
@@ -1138,6 +1139,7 @@ mod tests {
             data: ImageData::Url {
                 url: "https://example.com/x.jpg".into(),
             },
+            description: None,
         }];
         let parts = multimodal_parts("look", &images);
         // Only the text part survives — URL images are not yet supported.
@@ -1152,6 +1154,7 @@ mod tests {
             data: ImageData::Base64 {
                 data: "JVBE".into(),
             },
+            description: None,
         }];
         let parts = multimodal_parts("summarise", &images);
         let inline = parts[1].inline_data.as_ref().unwrap();

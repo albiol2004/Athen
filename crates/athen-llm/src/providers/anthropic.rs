@@ -1204,6 +1204,7 @@ mod tests {
             data: ImageData::Base64 {
                 data: "AAAA".to_string(),
             },
+            description: None,
         }];
         let v = anthropic_multimodal_blocks("describe this", &images);
         let arr = v.as_array().expect("array");
@@ -1223,6 +1224,7 @@ mod tests {
             data: ImageData::Url {
                 url: "https://example.com/x.jpg".to_string(),
             },
+            description: None,
         }];
         let v = anthropic_multimodal_blocks("look", &images);
         let arr = v.as_array().unwrap();
@@ -1237,6 +1239,7 @@ mod tests {
             data: ImageData::Base64 {
                 data: "AAAA".to_string(),
             },
+            description: None,
         }];
         let v = anthropic_multimodal_blocks("", &images);
         let arr = v.as_array().unwrap();
@@ -1259,6 +1262,7 @@ mod tests {
                         data: ImageData::Base64 {
                             data: "AAAA".to_string(),
                         },
+                        description: None,
                     }],
                 },
             }],

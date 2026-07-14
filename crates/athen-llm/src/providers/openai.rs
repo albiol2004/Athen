@@ -2159,6 +2159,7 @@ data: [DONE]
                 data: ImageData::Base64 {
                     data: "AAAA".to_string(),
                 },
+                description: None,
             }],
         );
         let arr = v.as_array().expect("array");
@@ -2178,6 +2179,7 @@ data: [DONE]
                 data: ImageData::Url {
                     url: "https://example.com/x.jpg".to_string(),
                 },
+                description: None,
             }],
         );
         let arr = v.as_array().unwrap();
@@ -2198,6 +2200,7 @@ data: [DONE]
                         data: ImageData::Base64 {
                             data: "AAAA".to_string(),
                         },
+                        description: None,
                     }],
                 },
             }],

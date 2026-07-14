@@ -1228,6 +1228,69 @@ impl ArcStore {
         .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
     }
 
+    /// Fetch the cached vision-model description for an image inside a
+    /// Multimodal message, keyed by `(arc_id, entry_id, image_index)`. Returns
+    /// `None` when no description has been generated yet. Used by the
+    /// describe-and-inject bridge to reuse a description verbatim rather than
+    /// regenerating it (which would break per-model prompt caching).
+    pub async fn get_image_description(
+        &self,
+        arc_id: &str,
+        entry_id: i64,
+        image_index: i64,
+    ) -> Result<Option<String>> {
+        let conn = self.conn.clone();
+        let arc_id = arc_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let result = conn.query_row(
+                "SELECT description FROM arc_image_descriptions \
+                 WHERE arc_id = ?1 AND entry_id = ?2 AND image_index = ?3",
+                params![arc_id, entry_id, image_index],
+                |row| row.get::<_, String>(0),
+            );
+            match result {
+                Ok(desc) => Ok(Some(desc)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(e) => Err(AthenError::Other(format!("Get image description: {e}"))),
+            }
+        })
+        .await
+        .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
+    }
+
+    /// Persist a vision-model description for an image, keyed by
+    /// `(arc_id, entry_id, image_index)`. Deterministic-once: uses
+    /// `INSERT OR IGNORE`, so an existing description is never overwritten —
+    /// the first-generated text is the one every later run reuses. Survives
+    /// reload because it lives in its own table (the images are re-surfaced
+    /// from the AttachmentStore each run, not stored in `arc_entries.content`).
+    pub async fn set_image_description_if_absent(
+        &self,
+        arc_id: &str,
+        entry_id: i64,
+        image_index: i64,
+        description: &str,
+    ) -> Result<()> {
+        let conn = self.conn.clone();
+        let arc_id = arc_id.to_string();
+        let description = description.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let now = Utc::now().to_rfc3339();
+            conn.execute(
+                "INSERT OR IGNORE INTO arc_image_descriptions \
+                 (arc_id, entry_id, image_index, description, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![arc_id, entry_id, image_index, description, now],
+            )
+            .map_err(|e| AthenError::Other(format!("Set image description: {e}")))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
+    }
+
     /// Set the agent profile this arc runs under. Pass `None` to clear (which
     /// makes the arc fall back to the seeded default profile).
     pub async fn set_active_profile_id(&self, id: &str, profile_id: Option<&str>) -> Result<()> {
@@ -2204,6 +2267,24 @@ CREATE TABLE IF NOT EXISTS arc_entries (
 );
 
 CREATE INDEX IF NOT EXISTS idx_arc_entries_arc ON arc_entries(arc_id);
+
+-- Cached vision-model descriptions for images that ride in a Multimodal
+-- message. Keyed by (arc_id, entry_id, image_index) because the images
+-- themselves are re-surfaced from the AttachmentStore each run rather than
+-- stored in `arc_entries.content` — so the description can't ride in the
+-- content JSON. Written deterministically-once by the describe-and-inject
+-- bridge (athen-app): generated the first time a non-vision primary model
+-- needs to read the image, then reused verbatim so per-model prompt caching
+-- stays byte-stable. `CREATE TABLE IF NOT EXISTS` doubles as the migration
+-- for existing databases (init_schema runs the batch on every open).
+CREATE TABLE IF NOT EXISTS arc_image_descriptions (
+    arc_id TEXT NOT NULL,
+    entry_id INTEGER NOT NULL,
+    image_index INTEGER NOT NULL,
+    description TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (arc_id, entry_id, image_index)
+);
 "#;
 
 #[cfg(test)]
@@ -2281,6 +2362,48 @@ mod tests {
         let a2 = arcs.iter().find(|a| a.id == "arc_2").unwrap();
         assert_eq!(a2.name, "Email Arc");
         assert_eq!(a2.source, ArcSource::Email);
+    }
+
+    #[tokio::test]
+    async fn image_description_round_trips_and_is_deterministic_once() {
+        let store = setup_arc_store().await;
+        store
+            .create_arc("arc_1", "Vision Arc", ArcSource::UserInput)
+            .await
+            .unwrap();
+
+        // Absent before any write.
+        assert_eq!(
+            store.get_image_description("arc_1", 42, 0).await.unwrap(),
+            None
+        );
+
+        // First write persists.
+        store
+            .set_image_description_if_absent("arc_1", 42, 0, "a red square")
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_image_description("arc_1", 42, 0).await.unwrap(),
+            Some("a red square".to_string())
+        );
+
+        // Deterministic-once: a second write for the same key must NOT
+        // overwrite the first-generated description.
+        store
+            .set_image_description_if_absent("arc_1", 42, 0, "a blue circle")
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_image_description("arc_1", 42, 0).await.unwrap(),
+            Some("a red square".to_string())
+        );
+
+        // Distinct image_index is an independent slot.
+        assert_eq!(
+            store.get_image_description("arc_1", 42, 1).await.unwrap(),
+            None
+        );
     }
 
     #[tokio::test]

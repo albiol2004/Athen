@@ -165,6 +165,45 @@ pub type LoopStartRunner = std::sync::Arc<
         + Sync,
 >;
 
+/// Outcome of an agent-triggered `see_image` run. Mirrors [`LoopStartOutcome`]:
+/// the runner returns this and the handler maps it to a [`ToolResult`] in-band
+/// (no exceptions escape to the model).
+pub enum SeeImageOutcome {
+    /// The vision-slot model answered the question about the picked image.
+    Answer {
+        answer: String,
+        /// The 0-based index of the image that was inspected (echoed back so
+        /// the agent can disambiguate when several images are attached).
+        image_index: i64,
+    },
+    /// No image was available at the requested index (none attached, or the
+    /// index was out of range). Carries a human-readable reason the tool
+    /// relays to the agent so it doesn't retry blindly.
+    NoImage(String),
+}
+
+/// Injected by the composition root for top-level arcs ONLY, and only when the
+/// arc's resolved primary model is non-vision AND a Bundle vision slot is
+/// configured (a vision-capable primary sees the image inline and needs no
+/// tool). Captures the arc id + UiBridge; at call time it re-surfaces the arc's
+/// attached images, picks one by index, and runs the vision-slot provider
+/// against it with the agent's question. `None` for sub-agent / worker /
+/// loop-role registries and for vision-capable / no-slot arcs — so the tool
+/// stays unlisted there (conditional exposure, GOAL Phase 5).
+/// Parameters: image index (0-based), question.
+pub type SeeImageRunner = std::sync::Arc<
+    dyn Fn(
+            i64,
+            String,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = std::result::Result<SeeImageOutcome, String>>
+                    + Send,
+            >,
+        > + Send
+        + Sync,
+>;
+
 /// Wraps [`ShellToolRegistry`] and adds calendar, contact, memory, and MCP tools.
 pub struct AppToolRegistry {
     inner: Arc<ShellToolRegistry>,
@@ -229,6 +268,14 @@ pub struct AppToolRegistry {
     /// start another loop — docs/LOOP_MODE.md "No recursion"). Same injection
     /// discipline as `deep_research_runner`.
     loop_start_runner: Option<LoopStartRunner>,
+    /// Runner for the agent-callable `see_image` tool. Injected by the
+    /// composition root for top-level interactive arcs ONLY, and only when the
+    /// arc's resolved primary model can't see AND a Bundle vision slot is
+    /// configured (conditional exposure — a vision-capable primary inlines the
+    /// image and doesn't need the tool). `None` everywhere else keeps the tool
+    /// unlisted. Same top-level-only injection discipline as
+    /// `deep_research_runner`.
+    see_image_runner: Option<SeeImageRunner>,
 }
 
 impl AppToolRegistry {
@@ -264,6 +311,7 @@ impl AppToolRegistry {
             active_project_slug: None,
             deep_research_runner: None,
             loop_start_runner: None,
+            see_image_runner: None,
         }
     }
 
@@ -319,6 +367,17 @@ impl AppToolRegistry {
     /// discipline as [`Self::with_deep_research_runner`].
     pub fn with_loop_start_runner(mut self, r: Option<LoopStartRunner>) -> Self {
         self.loop_start_runner = r;
+        self
+    }
+
+    /// Attach the runner closure that powers the agent-callable `see_image`
+    /// tool. Set only for top-level interactive arcs whose resolved primary is
+    /// non-vision AND that have a configured Bundle vision slot; `None`
+    /// otherwise (vision-capable primary, no slot, or sub-agent / worker /
+    /// loop-role registry) keeps the tool unlisted. Same top-level-only
+    /// discipline as [`Self::with_deep_research_runner`].
+    pub fn with_see_image_runner(mut self, r: Option<SeeImageRunner>) -> Self {
+        self.see_image_runner = r;
         self
     }
 
@@ -1860,6 +1919,24 @@ impl AppToolRegistry {
         })
     }
 
+    fn see_image_schema() -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "question": {
+                    "type": "string",
+                    "description": "What you want to know about the image. Be specific — e.g. 'What exact number is in cell B3?', 'Transcribe all text in this screenshot', 'What colour is the button?'. A vision model inspects the actual image and answers.",
+                },
+                "image_index": {
+                    "type": "integer",
+                    "description": "Which attached image to look at, 0-based in the order they were attached (0 = the first image). Defaults to 0. Use this when the turn included more than one image.",
+                    "minimum": 0,
+                },
+            },
+            "required": ["question"]
+        })
+    }
+
     /// Pure mapping from a semantic category + filename to the relative
     /// workspace path the `write` tool should receive. Kept free of `self`
     /// so the bucket/slug/sanitization logic is unit-testable.
@@ -2140,6 +2217,82 @@ impl AppToolRegistry {
             Ok(LoopStartOutcome::Refused(reason)) => Ok(ToolResult {
                 success: false,
                 output: json!({ "status": "refused", "message": reason.clone() }),
+                error: Some(reason),
+                execution_time_ms: start.elapsed().as_millis() as u64,
+            }),
+            Err(e) => Ok(ToolResult {
+                success: false,
+                output: json!({ "error": e.clone() }),
+                error: Some(e),
+                execution_time_ms: start.elapsed().as_millis() as u64,
+            }),
+        }
+    }
+
+    /// Agent-callable deeper-look at a specific attached image. Thin in-band
+    /// shell over the injected [`SeeImageRunner`] closure, which owns image
+    /// resolution + the vision-slot completion. The handler only parses args
+    /// and maps the outcome to a [`ToolResult`], mirroring
+    /// [`Self::do_deep_research`] / [`Self::do_start_loop`].
+    async fn do_see_image(&self, args: &serde_json::Value) -> Result<ToolResult> {
+        let start = Instant::now();
+
+        // Belt-and-suspenders: the tool isn't listed without a runner (and only
+        // a non-vision primary + configured vision slot gets one), but a model
+        // could still try to call it. Refuse cleanly.
+        let Some(runner) = self.see_image_runner.clone() else {
+            return Ok(ToolResult {
+                success: false,
+                output: json!({ "error": "Looking at an image isn't available in this context." }),
+                error: Some("see_image_unavailable".to_string()),
+                execution_time_ms: start.elapsed().as_millis() as u64,
+            });
+        };
+
+        let question = match args
+            .get("question")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(q) => q.to_string(),
+            None => {
+                let msg = "see_image: missing required 'question'".to_string();
+                return Ok(ToolResult {
+                    success: false,
+                    output: json!({ "error": msg }),
+                    error: Some(msg),
+                    execution_time_ms: start.elapsed().as_millis() as u64,
+                });
+            }
+        };
+
+        // Optional 0-based image index; default 0. Negative values clamp to 0.
+        let image_index = args
+            .get("image_index")
+            .and_then(|v| v.as_i64())
+            .filter(|n| *n >= 0)
+            .unwrap_or(0);
+
+        match runner(image_index, question).await {
+            Ok(SeeImageOutcome::Answer {
+                answer,
+                image_index,
+            }) => Ok(ToolResult {
+                success: true,
+                output: json!({
+                    "status": "ok",
+                    "image_index": image_index,
+                    "answer": answer,
+                }),
+                error: None,
+                execution_time_ms: start.elapsed().as_millis() as u64,
+            }),
+            // No image at that index is an expected outcome the agent should
+            // relay to the user, not a hard error.
+            Ok(SeeImageOutcome::NoImage(reason)) => Ok(ToolResult {
+                success: false,
+                output: json!({ "status": "no_image", "message": reason.clone() }),
                 error: Some(reason),
                 execution_time_ms: start.elapsed().as_millis() as u64,
             }),
@@ -3672,6 +3825,27 @@ impl ToolRegistry for AppToolRegistry {
             });
         }
 
+        // see_image: only advertised when a runner closure is wired — and the
+        // composition root wires one ONLY for a top-level arc whose resolved
+        // primary model can't see AND that has a configured Bundle vision slot
+        // (conditional exposure, GOAL Phase 5). A vision-capable primary inlines
+        // the image directly and never sees this tool; sub-agent / worker /
+        // loop-role registries get `None`. Kept in this STABLE list_tools prefix
+        // (never injected mid-conversation) so per-model prompt caching stays
+        // byte-stable.
+        if self.see_image_runner.is_some() {
+            tools.push(ToolDefinition {
+                name: "see_image".to_string(),
+                description: "Look closely at an image the user attached and answer a specific question about it. Your own model can't see images directly, but a vision model can inspect one on demand and report back — use this for a lossless deeper look when you need to read exact details (text, numbers, colours, layout, a value in a specific cell). Pass the question and, if several images were attached, the 0-based image_index (defaults to 0).".to_string(),
+                parameters: Self::see_image_schema(),
+                backend: ToolBackend::Shell {
+                    command: String::new(),
+                    native: false,
+                },
+                base_risk: BaseImpact::Read,
+            });
+        }
+
         if self.identity.is_some() {
             tools.push(ToolDefinition {
                 name: "identity_add".to_string(),
@@ -3855,6 +4029,7 @@ impl ToolRegistry for AppToolRegistry {
             "save_file" => self.do_save_file(&args).await,
             "deep_research" => self.do_deep_research(&args).await,
             "start_loop" => self.do_start_loop(&args).await,
+            "see_image" => self.do_see_image(&args).await,
             "load_skill" => self.do_load_skill(&args).await,
             "athen_docs" => self.do_athen_docs(&args),
             "http_request" => self.do_http_request(&args).await,
@@ -3892,6 +4067,38 @@ mod tests {
         assert!(!body_chunk_would_overflow(0, 0, 100));
         // Saturating add: an absurd chunk length can't wrap past the cap.
         assert!(body_chunk_would_overflow(usize::MAX - 1, 5, 100));
+    }
+
+    /// GOAL Phase 5 — top-level-only injection of the `see_image` tool.
+    /// Source-scan guardrail (mirrors the start_loop one, and reads state.rs
+    /// from this file so nothing is self-referential): state.rs must build
+    /// EXACTLY ONE `SeeImageRunner` closure, and it must live inside the
+    /// top-level `assemble_app_tool_registry` — so no sub-agent / worker /
+    /// loop-role path can wire it (conditional exposure is enforced by the
+    /// `(Some(bridge), true, false)` match arm around that same closure).
+    #[test]
+    fn guardrail_see_image_runner_injected_only_at_top_level() {
+        let state = include_str!("state.rs");
+        let cast_marker = "as crate::app_tools::SeeImageRunner";
+        assert_eq!(
+            state.matches(cast_marker).count(),
+            1,
+            "there must be exactly ONE see_image runner closure in state.rs (the \
+             top-level injection point); a second builder would leak the tool into \
+             a sub-agent / worker / loop-role registry"
+        );
+        // The sole cast must live after the top-level wrapper's signature — i.e.
+        // the bytes before it include `assemble_app_tool_registry` but the base
+        // assembler's own signature receives the runner as a plain param (no
+        // cast). This keeps the Some(..) builder out of every bare-base path.
+        let cast_pos = state.find(cast_marker).unwrap();
+        let top_sig = state
+            .find("pub(crate) async fn assemble_app_tool_registry")
+            .expect("top-level assembler must exist");
+        assert!(
+            cast_pos > top_sig,
+            "the see_image runner closure must be built inside the top-level assembler"
+        );
     }
 
     #[test]

@@ -760,6 +760,7 @@ pub(crate) async fn assemble_base_app_tool_registry(
     ui: Option<crate::ui_bridge::UiBridge>,
     deep_research_runner: Option<crate::app_tools::DeepResearchRunner>,
     loop_start_runner: Option<crate::app_tools::LoopStartRunner>,
+    see_image_runner: Option<crate::app_tools::SeeImageRunner>,
 ) -> Arc<dyn athen_core::traits::tool::ToolRegistry> {
     // Resolve the active profile's GitHub identity once at registry
     // build time so every shell_execute in this arc uses the same
@@ -966,6 +967,13 @@ pub(crate) async fn assemble_base_app_tool_registry(
     // another loop). Same discipline as the deep_research runner above.
     registry = registry.with_loop_start_runner(loop_start_runner);
 
+    // Agent-callable see_image tool: wired only when the caller passes a runner.
+    // The top-level `assemble_app_tool_registry` builds one ONLY for a
+    // non-vision primary + configured vision slot (conditional exposure, GOAL
+    // Phase 5); every other caller (sub-agent / worker / loop-role / save-only)
+    // passes `None`, keeping the tool unlisted there.
+    registry = registry.with_see_image_runner(see_image_runner);
+
     Arc::new(registry)
 }
 
@@ -1133,10 +1141,18 @@ pub(crate) fn build_subagent_factories(
         Box::pin(async move {
             // Snapshot deps and drop the state borrow before awaiting.
             let deps = ui.app_state().tool_registry_deps();
-            // Sub-agents never get the deep_research tool (no runner) — keeps
-            // the bare worker registry bare and prevents recursive runs.
-            let base =
-                assemble_base_app_tool_registry(deps, &sub_arc, Some(ui.clone()), None, None).await;
+            // Sub-agents never get the deep_research / start_loop / see_image
+            // tools (no runner) — keeps the bare worker registry bare and
+            // prevents recursive runs.
+            let base = assemble_base_app_tool_registry(
+                deps,
+                &sub_arc,
+                Some(ui.clone()),
+                None,
+                None,
+                None,
+            )
+            .await;
             Box::new(crate::delegation::ArcRegistryAdapter(base))
                 as Box<dyn athen_core::traits::tool::ToolRegistry>
         })
@@ -1308,6 +1324,10 @@ pub(crate) async fn assemble_app_tool_registry(
     let router = Arc::clone(&deps.router);
     let wakeup_store = deps.wakeup_store.clone();
     let approval_router = deps.approval_router.clone();
+    // Cloned for the see_image conditional-exposure check below (resolving the
+    // arc's primary vision capability) before `deps` is moved into the base.
+    let active_provider_id_for_vision = deps.active_provider_id.clone();
+    let arc_store_for_vision = deps.arc_store.clone();
 
     // Build the deep_research runner closure for this top-level arc. Requires a
     // UiBridge (it resolves AppState + emits progress events through it), so
@@ -1495,8 +1515,64 @@ pub(crate) async fn assemble_app_tool_registry(
         }) as crate::app_tools::LoopStartRunner
     });
 
-    let base =
-        assemble_base_app_tool_registry(deps, arc_id, ui.clone(), dr_runner, loop_runner).await;
+    // Build the see_image runner closure — but ONLY under conditional exposure
+    // (GOAL Phase 5): the arc's resolved primary model must be non-vision AND a
+    // Bundle vision slot must be configured. A vision-capable primary inlines
+    // the image directly and needs no tool; with no vision slot there's nothing
+    // to run. Resolve the arc's primary capability + slot presence here so the
+    // tool is simply absent (not just refusing) when it doesn't apply.
+    let see_image_runner: Option<crate::app_tools::SeeImageRunner> = {
+        let cfg = load_config();
+        let slot_configured = resolve_vision_target(&cfg).is_some();
+        let primary_can_see = if slot_configured {
+            let target = resolve_effective_provider_for_arc_with_config(
+                arc_store_for_vision.as_ref(),
+                arc_id,
+                &active_provider_id_for_vision,
+                ModelProfile::Powerful,
+                &cfg,
+            )
+            .await;
+            arc_primary_supports_vision(&cfg, &target, ModelProfile::Powerful)
+        } else {
+            // Slot check short-circuits; primary capability is irrelevant.
+            true
+        };
+        match (ui.as_ref(), slot_configured, primary_can_see) {
+            (Some(bridge), true, false) => {
+                let ui = bridge.clone();
+                let arc_id = arc_id.to_string();
+                Some(std::sync::Arc::new(move |image_index: i64, question: String| {
+                    let ui = ui.clone();
+                    let arc_id = arc_id.clone();
+                    Box::pin(async move {
+                        run_see_image(ui, arc_id, image_index, question).await
+                    })
+                        as std::pin::Pin<
+                            Box<
+                                dyn std::future::Future<
+                                        Output = std::result::Result<
+                                            crate::app_tools::SeeImageOutcome,
+                                            String,
+                                        >,
+                                    > + Send,
+                            >,
+                        >
+                }) as crate::app_tools::SeeImageRunner)
+            }
+            _ => None,
+        }
+    };
+
+    let base = assemble_base_app_tool_registry(
+        deps,
+        arc_id,
+        ui.clone(),
+        dr_runner,
+        loop_runner,
+        see_image_runner,
+    )
+    .await;
 
     let with_delegation: Box<dyn athen_core::traits::tool::ToolRegistry> =
         if let (Some(profile_store), Some(arc_store)) = (profile_store, arc_store_for_delegation) {
@@ -2437,6 +2513,8 @@ impl AppState {
                 None,
                 // No start_loop tool either — same no-recursion discipline.
                 None,
+                // No see_image tool for the worker base.
+                None,
             )
             .await;
 
@@ -2599,17 +2677,19 @@ impl AppState {
         }
 
         // ── Build the BARE base tool registry for the roles — same bare base a
-        // sub-agent receives. The two trailing `None`s are the deep-research
-        // runner slot and the start_loop runner slot: withholding BOTH keeps
-        // recursion-triggering surfaces off the role registries. This is the
-        // load-bearing no-recursion guarantee — a loop role (loop_lead /
-        // loop_evaluator) gets no `start_loop` tool, so it can never start
-        // another loop (docs/LOOP_MODE.md "No recursion"). ─────────────────────
+        // sub-agent receives. The three trailing `None`s are the deep-research
+        // runner slot, the start_loop runner slot, and the see_image runner
+        // slot: withholding all three keeps recursion-triggering surfaces off
+        // the role registries. This is the load-bearing no-recursion guarantee
+        // — a loop role (loop_lead / loop_evaluator) gets no `start_loop` tool,
+        // so it can never start another loop (docs/LOOP_MODE.md "No
+        // recursion"). ──────────────────────────────────────────────────────
         let base: Arc<dyn athen_core::traits::tool::ToolRegistry> =
             assemble_base_app_tool_registry(
                 self.tool_registry_deps(),
                 arc_id,
                 Some(ui.clone()),
+                None,
                 None,
                 None,
             )
@@ -6488,6 +6568,204 @@ fn resolve_from_active_bundle(cfg: &AthenConfig, tier: ModelProfile) -> Option<(
     Some((connection_id, slug))
 }
 
+/// Single source of truth for "can the resolved primary model of an arc see
+/// images?". Looks up the slug's `ModelFamily` via the per-slug quirks
+/// registry (the same key `build_provider_instance` uses), then consults the
+/// curated `family_supports_vision` table. If the family is known
+/// (`Some(true)`/`Some(false)`) that wins; otherwise (unknown slug / custom
+/// family) it falls back to the per-Connection `supports_vision` checkbox —
+/// the existing user override for models the registry has never seen.
+///
+/// This is deliberately Connection+slug scoped (not just the Connection flag)
+/// so a Bundle that mixes a vision Claude tier with a text-only DeepSeek tier
+/// resolves each correctly. Consumed by the Phase 4 describe-and-inject bridge
+/// via [`arc_primary_supports_vision`].
+pub(crate) fn resolve_supports_vision(
+    connection_id: &str,
+    slug: &str,
+    provider_cfg: Option<&athen_core::config::ProviderConfig>,
+) -> bool {
+    if let Some(quirks) = quirks_seed::lookup_slug_quirks(connection_id, slug) {
+        if let Some(v) = quirks_seed::family_supports_vision(quirks.family) {
+            return v;
+        }
+    }
+    // Unknown slug / family — defer to the per-Connection override.
+    provider_cfg.is_some_and(|c| c.supports_vision)
+}
+
+/// Whether the arc's **resolved primary** model (the model the executor will
+/// route `tier` to) can see images. Resolves the concrete `(connection, slug)`
+/// the run will use — a live slug pin wins; otherwise the active Bundle's
+/// `tier` pick; otherwise the legacy Connection `default_model` — then
+/// delegates to [`resolve_supports_vision`] (curated family table, falling
+/// back to the per-Connection `supports_vision` flag for unknown slugs).
+///
+/// This is the single authority the Phase 4 describe-and-inject bridge keys
+/// on. Trace: a DeepSeek-tier arc resolves `false`, a Claude-tier arc `true`.
+pub(crate) fn arc_primary_supports_vision(
+    cfg: &AthenConfig,
+    target: &EffectiveProviderTarget,
+    tier: ModelProfile,
+) -> bool {
+    let (cid, slug) = match &target.pinned_slug {
+        Some(slug) => (target.provider_id.clone(), slug.clone()),
+        None => resolve_from_active_bundle(cfg, tier).unwrap_or_else(|| {
+            let slug = cfg
+                .models
+                .providers
+                .get(&target.provider_id)
+                .map(|p| p.default_model.clone())
+                .unwrap_or_default();
+            (target.provider_id.clone(), slug)
+        }),
+    };
+    let provider_cfg = cfg.models.providers.get(&cid);
+    resolve_supports_vision(&cid, &slug, provider_cfg)
+}
+
+/// Returns the `(connection_id, slug)` pick for the active Bundle's dedicated
+/// **vision** slot, or `None` when no active Bundle is set, the active Bundle
+/// has no `vision` slot filled, or its picked Connection has been deleted.
+///
+/// Mirrors [`resolve_from_active_bundle`] but reads the standalone
+/// `Bundle.vision` slot instead of a `ModelProfile` tier — the vision model is
+/// never routed to by complexity tiering; it is invoked only by explicit vision
+/// calls (the Phase 4 describe-and-inject bridge and the Phase 5 `see_image`
+/// tool).
+pub(crate) fn resolve_vision_target(cfg: &AthenConfig) -> Option<(String, String)> {
+    let bundle_id = cfg.models.assignments.get(ACTIVE_BUNDLE_KEY)?;
+    let bundle = cfg.models.bundles.get(bundle_id)?;
+    let vision = bundle.vision.as_ref()?;
+    if !cfg.models.providers.contains_key(&vision.connection_id) {
+        warn!(
+            connection_id = %vision.connection_id,
+            bundle = %bundle.name,
+            "active Bundle's vision slot references a deleted Connection; no vision model available"
+        );
+        return None;
+    }
+    Some((vision.connection_id.clone(), vision.slug.clone()))
+}
+
+/// Build a standalone provider instance for the active Bundle's vision slot,
+/// hydrating the picked Connection's credentials from the vault. Returns `None`
+/// when no vision slot is configured (or its Connection has been deleted).
+///
+/// Vision calls are single non-streaming completions — they do NOT go through
+/// the tiered [`DefaultLlmRouter`]; each call constructs (or reuses) this
+/// standalone instance directly. Credential resolution mirrors
+/// [`build_router_for_bundle`] exactly (hydrated `auth` → `{CID}_API_KEY` env
+/// fallback; `endpoint` → per-connection default base URL).
+pub(crate) async fn build_vision_provider(
+    cfg: &AthenConfig,
+    vault: Option<&Arc<dyn athen_core::traits::vault::Vault>>,
+) -> Option<Box<dyn LlmProvider>> {
+    let (cid, slug) = resolve_vision_target(cfg)?;
+    // Hydrate credentials for the vision Connection from the vault (same
+    // discipline as the tier routers). Clone the models config so hydration
+    // doesn't mutate the caller's snapshot.
+    let mut models = cfg.models.clone();
+    crate::vault_creds::hydrate_models_from_vault(vault, &mut models).await;
+    let conn = models.providers.get(&cid)?;
+    let api_key = match &conn.auth {
+        AuthType::ApiKey(k) if !k.is_empty() && !k.starts_with("${") => Some(k.clone()),
+        _ => std::env::var(format!("{}_API_KEY", cid.to_uppercase()))
+            .ok()
+            .filter(|k| !k.is_empty()),
+    };
+    let base_url = conn
+        .endpoint
+        .clone()
+        .unwrap_or_else(|| crate::settings::default_base_url(&cid).to_string());
+    Some(build_provider_instance(
+        &cid,
+        &base_url,
+        &slug,
+        api_key.as_deref(),
+        // The vision slot is by definition a vision-capable model.
+        true,
+        conn.supports_documents,
+        conn.family,
+    ))
+}
+
+/// Backing implementation of the agent-callable `see_image` tool (GOAL Phase
+/// 5). Resolves `&AppState` from the [`UiBridge`] at call time, re-surfaces the
+/// arc's attached images (the same `latest_sense_event_id_in_arc` +
+/// `prepare_attachment_surfacing` path the Phase-4 bridge uses, so image ordering
+/// matches), picks the one at `image_index`, and runs the Bundle vision-slot
+/// provider against it with the agent's question. Only ever wired for a
+/// non-vision primary + configured slot, so the raw bytes reach the vision
+/// provider only — never the non-vision primary.
+///
+/// Returns `Ok(SeeImageOutcome::NoImage(..))` for expected "nothing to look at"
+/// cases (no attachment, index out of range, slot vanished) so the agent relays
+/// a clear message; `Err(..)` only when the vision completion itself fails.
+async fn run_see_image(
+    ui: crate::ui_bridge::UiBridge,
+    arc_id: String,
+    image_index: i64,
+    question: String,
+) -> std::result::Result<crate::app_tools::SeeImageOutcome, String> {
+    use crate::app_tools::SeeImageOutcome;
+
+    let state = ui.app_state();
+    let cfg = load_config();
+
+    // The vision slot is the only model that can actually see. Absent (config
+    // changed since the tool was wired) → clean in-band refusal.
+    let Some(provider) = build_vision_provider(&cfg, state.vault.as_ref()).await else {
+        return Ok(SeeImageOutcome::NoImage(
+            "No Vision model is configured. Open Settings → Bundles and pick a Vision model so \
+             images can be inspected."
+                .to_string(),
+        ));
+    };
+
+    // Re-surface the arc's attached images from the latest sense event.
+    let attachment_store_opt = state.attachment_store();
+    let (Some(arc_store), Some(astore)) =
+        (state.arc_store.as_ref(), attachment_store_opt.as_ref())
+    else {
+        return Ok(SeeImageOutcome::NoImage(
+            "Image storage isn't available in this context.".to_string(),
+        ));
+    };
+    let Some(event_id) =
+        crate::commands::latest_sense_event_id_in_arc(arc_store, &arc_id).await
+    else {
+        return Ok(SeeImageOutcome::NoImage(
+            "No attached image was found in this conversation.".to_string(),
+        ));
+    };
+    // `supports_vision = true` so the image bytes are read (the vision provider
+    // will consume them); documents irrelevant here.
+    let surfacing =
+        crate::commands::prepare_attachment_surfacing(event_id, astore, true, false).await;
+    let images = surfacing.images;
+    if images.is_empty() {
+        return Ok(SeeImageOutcome::NoImage(
+            "No attached image was found in this conversation.".to_string(),
+        ));
+    }
+    let Some(image) = images.get(image_index as usize) else {
+        return Ok(SeeImageOutcome::NoImage(format!(
+            "There is no image at index {image_index}; this conversation has {} attached \
+             image(s) (0-based indexing).",
+            images.len()
+        )));
+    };
+
+    match crate::vision_bridge::answer_about_image(&*provider, image, &question).await {
+        Ok(answer) => Ok(SeeImageOutcome::Answer {
+            answer,
+            image_index,
+        }),
+        Err(e) => Err(format!("The Vision model failed to inspect the image: {e}")),
+    }
+}
+
 /// Sparse-tier fallback ladder per `docs/BUNDLES.md`. A Bundle that only
 /// sets Cheap is a valid config — every other tier collapses onto it.
 /// Local stays isolated (no cross-tier fallback) because Local routing
@@ -8944,6 +9222,7 @@ mod resolve_effective_provider_tests {
             created_at: now,
             updated_at: now,
             tiers: map,
+            vision: None,
         }
     }
 

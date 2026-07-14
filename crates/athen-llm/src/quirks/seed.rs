@@ -279,6 +279,58 @@ pub fn quirks_for_family(family: ModelFamily) -> ModelQuirks {
     }
 }
 
+/// Curated per-`ModelFamily` vision (image-input) capability.
+///
+/// `Some(true)` = the family accepts image input; `Some(false)` = it is
+/// text-only; `None` = we don't know for this family (custom / unprofiled) —
+/// callers fall back to the per-Connection `supports_vision` flag.
+///
+/// BEST-EFFORT (per vendor docs, 2026-07-14): capability is asserted from each
+/// vendor's public model card, not verified against every dated slug. When a
+/// family's multimodality is uncertain, prefer `Some(false)` (safe: the
+/// describe-and-inject bridge still handles the image) or `None` (defer to the
+/// user's per-Connection checkbox) over an optimistic `Some(true)`.
+pub fn family_supports_vision(family: ModelFamily) -> Option<bool> {
+    match family {
+        // Vision-capable frontier families.
+        ModelFamily::ClaudeOpus47
+        | ModelFamily::ClaudeSonnet46
+        | ModelFamily::ClaudeHaiku45 => Some(true), // Claude 4.x is multimodal.
+        ModelFamily::Gpt5 | ModelFamily::OpenAiO3 => Some(true), // GPT-5 line / o-series see images.
+        ModelFamily::Gemini3Pro | ModelFamily::Gemini3Flash => Some(true), // Gemini 3.x multimodal.
+        ModelFamily::MiniMaxM3Cloud => Some(true), // MiniMax M3 accepts image input.
+        ModelFamily::Grok4 | ModelFamily::Grok45 => Some(true), // Grok 4.x is multimodal.
+        // The Llama 3.2 / Llama 4 families are heterogeneous — they span
+        // vision checkpoints (3.2 90B-Vision, Llama 4 Scout/Maverick) AND
+        // text-only ones (3.2 1B/3B). A curated verdict here would override
+        // the per-Connection `supports_vision` checkbox and couldn't be
+        // corrected for a text-only slug, so we return `None` and let the
+        // user's checkbox govern (BEST-EFFORT: flip a specific slug via the
+        // Connection's vision toggle).
+        ModelFamily::Llama32Instruct | ModelFamily::Llama4Instruct => None,
+
+        // Known text-only families.
+        ModelFamily::DeepSeekV4Chat
+        | ModelFamily::DeepSeekV4Pro
+        | ModelFamily::DeepSeekR1 => Some(false),
+        ModelFamily::Qwen35Local
+        | ModelFamily::Qwen36Local
+        | ModelFamily::Qwen3CoderNext => Some(false),
+        ModelFamily::KimiK26Cloud | ModelFamily::KimiK27Code => Some(false),
+        ModelFamily::MiniMaxM25Cloud | ModelFamily::MiniMaxM27Cloud => Some(false),
+        ModelFamily::Glm52 => Some(false), // glm-5.2 is text-focused.
+        ModelFamily::Codestral2508
+        | ModelFamily::MistralLarge3
+        | ModelFamily::MagistralMedium => Some(false),
+        ModelFamily::Llama33Instruct => Some(false), // Llama 3.3 70B is text-only.
+        ModelFamily::Gemma4Local => Some(false), // local Gemma text-only in our profile.
+        ModelFamily::Lfm25Local => Some(false), // on-device text-only.
+
+        // Unknown / generic — defer to the per-Connection checkbox.
+        ModelFamily::Default => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Per-slug quirks registry (Bundles Phase 3)
 // ---------------------------------------------------------------------------
@@ -495,6 +547,36 @@ mod tests {
                     family
                 );
             }
+        }
+    }
+
+    #[test]
+    fn family_vision_capability_is_curated() {
+        // Vision-capable frontier families.
+        assert_eq!(
+            family_supports_vision(ModelFamily::ClaudeSonnet46),
+            Some(true)
+        );
+        assert_eq!(family_supports_vision(ModelFamily::Gpt5), Some(true));
+        assert_eq!(family_supports_vision(ModelFamily::Gemini3Pro), Some(true));
+        assert_eq!(family_supports_vision(ModelFamily::Grok45), Some(true));
+        assert_eq!(
+            family_supports_vision(ModelFamily::MiniMaxM3Cloud),
+            Some(true)
+        );
+        // Known text-only families.
+        assert_eq!(
+            family_supports_vision(ModelFamily::DeepSeekV4Chat),
+            Some(false)
+        );
+        assert_eq!(family_supports_vision(ModelFamily::Glm52), Some(false));
+        assert_eq!(family_supports_vision(ModelFamily::KimiK27Code), Some(false));
+        assert_eq!(family_supports_vision(ModelFamily::Qwen35Local), Some(false));
+        // Unknown / generic defers to the per-Connection flag.
+        assert_eq!(family_supports_vision(ModelFamily::Default), None);
+        // Total over every variant (no panic; match is exhaustive).
+        for family in ModelFamily::all() {
+            let _ = family_supports_vision(*family);
         }
     }
 

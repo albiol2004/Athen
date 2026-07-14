@@ -42,6 +42,12 @@ pub struct BundleTiersView {
     pub fast: Option<BundleTierView>,
     pub code: Option<BundleTierView>,
     pub powerful: Option<BundleTierView>,
+    /// The dedicated "Vision model" slot (`Bundle.vision`) — not a
+    /// `ModelProfile` tier. Rides along with the tiers view so the editor
+    /// persists it in the same `update_bundle` round-trip. `serde(default)`
+    /// keeps older clients that omit the field working (treated as "clear").
+    #[serde(default)]
+    pub vision: Option<BundleTierView>,
 }
 
 /// A Bundle projected for the frontend. `id` is the stringified UUID
@@ -74,6 +80,10 @@ fn to_tiers_view(bundle: &Bundle) -> BundleTiersView {
         fast: pick(ModelProfile::Fast),
         code: pick(ModelProfile::Code),
         powerful: pick(ModelProfile::Powerful),
+        vision: bundle.vision.as_ref().map(|bt| BundleTierView {
+            connection_id: bt.connection_id.clone(),
+            slug: bt.slug.clone(),
+        }),
     }
 }
 
@@ -198,6 +208,7 @@ pub async fn create_bundle(name: String) -> std::result::Result<BundleView, Stri
         created_at: now,
         updated_at: now,
         tiers: HashMap::new(),
+        vision: None,
     };
     let id = bundle.id.to_string();
     models.bundles.insert(id.clone(), bundle.clone());
@@ -250,6 +261,13 @@ pub(crate) async fn update_bundle_core(
     }
     if let Some(new_tiers) = tiers {
         updated.tiers = from_tiers_view(&new_tiers);
+        // The vision slot rides along in the same view; a full-replacement
+        // save (the editor always sends the complete view) also updates it,
+        // so removing the picker in the UI clears `bundle.vision`.
+        updated.vision = new_tiers.vision.as_ref().map(|t| BundleTier {
+            connection_id: t.connection_id.clone(),
+            slug: t.slug.clone(),
+        });
     }
     updated.updated_at = chrono::Utc::now();
 
@@ -366,6 +384,7 @@ pub async fn duplicate_bundle(
         created_at: now,
         updated_at: now,
         tiers: source.tiers.clone(),
+        vision: source.vision.clone(),
     };
     let new_id = copy.id.to_string();
     models.bundles.insert(new_id.clone(), copy.clone());
@@ -402,6 +421,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             tiers: map,
+            vision: None,
         }
     }
 

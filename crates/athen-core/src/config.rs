@@ -399,6 +399,7 @@ impl ModelsConfig {
             created_at: now,
             updated_at: now,
             tiers,
+            vision: None,
         };
         let id = bundle.id;
         self.bundles.insert(id.to_string(), bundle);
@@ -423,6 +424,14 @@ pub struct Bundle {
     /// `Code → Fast → Cheap`, `Powerful → Fast → Cheap`, `Fast → Cheap`.
     /// Sparseness is a valid config — "I don't care to distinguish."
     pub tiers: HashMap<ModelProfile, BundleTier>,
+    /// Optional dedicated **vision model** slot. NOT a `ModelProfile` tier —
+    /// it is never routed to by the coordinator's complexity tiering; it is
+    /// invoked only by explicit vision calls (the describe-and-inject bridge
+    /// and the `see_image` tool) when the arc's resolved primary model can't
+    /// see. Presented in the UI as the bundle's "Vision model". Additive:
+    /// serde-default `None`, no migration.
+    #[serde(default)]
+    pub vision: Option<BundleTier>,
 }
 
 /// One tier's pick inside a [`Bundle`]: which Connection to send through

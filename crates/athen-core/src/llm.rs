@@ -127,6 +127,14 @@ pub struct ImageInput {
     /// IANA media type, e.g. `image/png`, `image/jpeg`, `image/webp`.
     pub mime_type: String,
     pub data: ImageData,
+    /// Cached vision-model description of this image, generated once by the
+    /// describe-and-inject bridge (`athen-app`) when the arc's resolved primary
+    /// model can't see. Persisted so it survives reload and is reused verbatim
+    /// (regenerating would break per-model prompt caching). `None` until a
+    /// description has been produced. Additive — serde default keeps older
+    /// persisted `ImageInput` JSON (which lacks the field) deserialisable.
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

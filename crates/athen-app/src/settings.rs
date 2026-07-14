@@ -1507,6 +1507,12 @@ pub(crate) async fn get_settings_core(
                         connection_id: t.connection_id.clone(),
                         slug: t.slug.clone(),
                     }),
+                vision: b.vision.as_ref().map(|t| {
+                    crate::bundle_settings::BundleTierView {
+                        connection_id: t.connection_id.clone(),
+                        slug: t.slug.clone(),
+                    }
+                }),
             };
             crate::bundle_settings::BundleView {
                 is_active: id == active_bundle_id,
@@ -2187,6 +2193,7 @@ pub(crate) async fn set_active_provider_core(
             created_at: now,
             updated_at: now,
             tiers,
+            vision: None,
         };
         models.bundles.insert(bundle.id.to_string(), bundle.clone());
         bundle

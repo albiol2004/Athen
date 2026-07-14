@@ -827,6 +827,7 @@ mod arg_parse_tests {
                         data: ImageData::Base64 {
                             data: "AAAA".to_string(),
                         },
+                        description: None,
                     }],
                 },
             }],

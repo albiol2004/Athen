@@ -2531,43 +2531,14 @@ pub(crate) async fn send_message_core(
             count = images.len(),
             "send_message: turn includes user-attached images"
         );
-        // Pre-flight: if the active provider can't accept images, fail
-        // with a clear, actionable message instead of letting each
-        // adapter surface its own provider-specific rejection. The
-        // toggle in Settings is advisory — DeepSeek's standard chat,
-        // plain Ollama, and llama.cpp all reject Multimodal at the
-        // adapter level regardless. A vision-capable provider (Claude
-        // 3.5+, GPT-4o, Gemini 1.5+) needs to be both *configured* and
-        // *active* before we even try.
-        let active_id = state.active_provider_id.lock().await.clone();
-        let models = crate::settings::load_models_config();
-        let active_supports_vision = models
-            .providers
-            .get(&active_id)
-            .is_some_and(|c| c.supports_vision);
-        // Adapters that hard-reject multimodal regardless of the user's
-        // toggle: DeepSeek's standard chat API and the bare local OpenAI-
-        // compat wrappers (Ollama, llama.cpp). Google (Gemini) carries
-        // images natively through `inlineData`. The generic
-        // `OpenAiCompatibleProvider` (any other id) *does* serialise
-        // images and trusts the supports_vision flag.
-        let adapter_can_carry_vision =
-            !matches!(active_id.as_str(), "deepseek" | "ollama" | "llamacpp");
-        if !(active_supports_vision && adapter_can_carry_vision) {
-            return Ok(ChatResponse {
-                content: format!(
-                    "Your active provider ({active_id}) doesn't accept image input. \
-                     Open Settings → LLM Providers and switch to a vision-capable \
-                     provider (Claude 3.5+, GPT-4o / GPT-4o-mini, Gemini 1.5+) — \
-                     tick the \"Vision-capable model\" box and activate it. Then \
-                     reattach the image and send again."
-                ),
-                risk_level: Some("Caution".into()),
-                domain: None,
-                tool_calls: vec![],
-                pending_approval: None,
-            });
-        }
+        // NOTE: we no longer pre-reject when the active model can't see.
+        // The Phase 4 describe-and-inject vision bridge (below, at the
+        // `combined_images` seam) resolves the arc's primary model's vision
+        // capability and either sends the image inline (vision model), has
+        // the Bundle's Vision slot describe it and injects the text
+        // (non-vision + slot), or drops the bytes with a placeholder + notice
+        // (non-vision + no slot). A non-vision provider therefore never
+        // receives a `Multimodal` turn it would reject.
     }
     // Stable id for every entry produced by this turn (user msg, tool calls,
     // assistant reply). The frontend groups by this for the dropdown UI.
@@ -2947,6 +2918,38 @@ pub(crate) async fn send_message_core(
             // earlier — only the executor sees the enriched description).
             let mut surfaced_images: Vec<athen_core::llm::ImageInput> = Vec::new();
             let mut executor_message = message.clone();
+
+            // Resolve the arc's pinned provider/slug *before* wiring the
+            // executor's router so a captured pin freezes the model for
+            // this run even if the user edits tier_models mid-task. The
+            // no-pin path returns the shared global router unchanged
+            // (fast path); a pinned arc gets its own slug-locked router
+            // built fresh from config. See `state::arc_router_for` and
+            // `docs/PROVIDER_PINNING.md`. Resolved here (ahead of attachment
+            // surfacing) so the Phase 4 vision bridge can decide up-front
+            // whether the arc's primary model can see.
+            let active_id_for_router = state.active_provider_id.lock().await.clone();
+            let effective_target = crate::state::resolve_effective_provider_for_arc(
+                state.arc_store.as_ref(),
+                &active_arc,
+                &active_id_for_router,
+                athen_core::llm::ModelProfile::Powerful,
+            )
+            .await;
+            let cfg_for_arc_router = crate::state::load_config();
+            // Phase 4: can the arc's *primary* model see? This decides whether
+            // the vision bridge (below) sends images inline or replaces them
+            // with text. Image attachments are always surfaced as bytes (the
+            // `true` below) so the bridge is the single authority over all
+            // three cases — inline / describe-via-slot / placeholder+notice —
+            // rather than surfacing pre-converting them to metadata text.
+            let primary_supports_vision = crate::state::arc_primary_supports_vision(
+                &cfg_for_arc_router,
+                &effective_target,
+                athen_core::llm::ModelProfile::Powerful,
+            );
+
+            let mut vision_event_id: Option<uuid::Uuid> = None;
             {
                 let arc_store_opt = state.arc_store.as_ref();
                 let attachment_store_opt = state.attachment_store();
@@ -2956,14 +2959,18 @@ pub(crate) async fn send_message_core(
                     if let Some(event_id) =
                         latest_sense_event_id_in_arc(arc_store, &active_arc).await
                     {
-                        let router_guard = state.router.read().await;
-                        let supports_vision = router_guard.any_provider_supports_vision();
-                        let supports_documents = router_guard.any_provider_supports_documents();
-                        drop(router_guard);
+                        vision_event_id = Some(event_id);
+                        let supports_documents = {
+                            let router_guard = state.router.read().await;
+                            router_guard.any_provider_supports_documents()
+                        };
                         let surfacing = prepare_attachment_surfacing(
                             event_id,
                             astore,
-                            supports_vision,
+                            // Always surface image attachments as bytes; the
+                            // Phase 4 vision bridge owns the see/can't-see
+                            // decision downstream.
+                            true,
                             supports_documents,
                         )
                         .await;
@@ -2982,22 +2989,6 @@ pub(crate) async fn send_message_core(
                 }
             }
 
-            // Resolve the arc's pinned provider/slug *before* wiring the
-            // executor's router so a captured pin freezes the model for
-            // this run even if the user edits tier_models mid-task. The
-            // no-pin path returns the shared global router unchanged
-            // (fast path); a pinned arc gets its own slug-locked router
-            // built fresh from config. See `state::arc_router_for` and
-            // `docs/PROVIDER_PINNING.md`.
-            let active_id_for_router = state.active_provider_id.lock().await.clone();
-            let effective_target = crate::state::resolve_effective_provider_for_arc(
-                state.arc_store.as_ref(),
-                &active_arc,
-                &active_id_for_router,
-                athen_core::llm::ModelProfile::Powerful,
-            )
-            .await;
-            let cfg_for_arc_router = crate::state::load_config();
             let arc_router_handle = crate::state::arc_router_for(
                 &state.router,
                 &effective_target,
@@ -3286,6 +3277,44 @@ pub(crate) async fn send_message_core(
             // are surfaced as text have an empty image list).
             let mut combined_images = images.clone();
             combined_images.extend(surfaced_images);
+            // Phase 4 — describe-and-inject vision bridge. Runs once, before
+            // the executor starts, keyed on the arc's resolved primary model's
+            // vision capability (`primary_supports_vision`, computed above).
+            // When the primary can't see, raw image bytes are replaced by a
+            // vision-model description (or a placeholder + notice when no
+            // Vision slot is set) appended to the user turn — so the non-vision
+            // provider never receives a `Multimodal` message it would reject.
+            // See `crate::vision_bridge` and GOAL Phase 4.
+            // TODO(vision): extend this bridge to the Telegram/wake-up
+            // executors (dispatch path around `surfaced_images` in
+            // `execute_dispatched_task`), which today still hard-branch on the
+            // global router's vision capability.
+            if !combined_images.is_empty() {
+                let vision_provider = if primary_supports_vision {
+                    None
+                } else {
+                    crate::state::build_vision_provider(&cfg_for_arc_router, state.vault.as_ref())
+                        .await
+                };
+                let cache_entry_id = vision_event_id
+                    .or_else(|| uuid::Uuid::parse_str(&turn_id).ok())
+                    .map(crate::vision_bridge::event_cache_id)
+                    .unwrap_or(0);
+                let bridged = crate::vision_bridge::prepare_images_for_vision(
+                    combined_images,
+                    primary_supports_vision,
+                    vision_provider,
+                    state.arc_store.as_ref(),
+                    &active_arc,
+                    cache_entry_id,
+                    ui,
+                )
+                .await;
+                combined_images = bridged.images;
+                if let Some(text) = bridged.injected_text {
+                    executor_message.push_str(&text);
+                }
+            }
             if !combined_images.is_empty() {
                 builder = builder.initial_user_images(combined_images);
             }
@@ -4165,6 +4194,9 @@ pub(crate) async fn execute_approved_task(
     // `fetch_attachment` with no UUID — the surfacing is what feeds the
     // turn-0 image / inline PDF text + the UUIDs the attachment tools
     // need. Mirrors execute_dispatched_task's surfacing block.
+    // TODO(vision): wire the Phase 4 describe-and-inject bridge here too so a
+    // non-vision primary transparently handles images on this executor path
+    // (currently branches only on the global router's vision capability).
     let mut surfaced_images: Vec<athen_core::llm::ImageInput> = Vec::new();
     if let (Some(arc_store), Some(astore)) = (ctx.arc_store.as_ref(), ctx.attachment_store.as_ref())
     {
@@ -4990,6 +5022,7 @@ pub(crate) async fn prepare_attachment_surfacing(
                         images.push(athen_core::llm::ImageInput {
                             mime_type: att.mime_type.clone(),
                             data: athen_core::llm::ImageData::Base64 { data: b64 },
+                            description: None,
                         });
                         suffix.push_str(" — inlined as multimodal image");
                     }
@@ -5364,6 +5397,10 @@ pub(crate) async fn execute_dispatched_task(
     // by metadata (the agent can call fetch_attachment / read_attachment_full
     // for them on demand). No-op when there is no source_event, no
     // attachment store wired (CLI/tests), or no attachments for the event.
+    // TODO(vision): wire the Phase 4 describe-and-inject bridge here too so a
+    // non-vision primary transparently handles images on the dispatched
+    // (Telegram/wake-up/coordinator) executor path — today it branches only on
+    // the global router's vision capability.
     let mut surfaced_images: Vec<athen_core::llm::ImageInput> = Vec::new();
     if let (Some(event_id), Some(astore)) = (task.source_event, ctx.attachment_store.as_ref()) {
         let router_guard = ctx.router.read().await;
@@ -10657,6 +10694,8 @@ pub(crate) async fn deep_research_core(
         // runs inside deep_research_core itself).
         None,
         // No start_loop tool either — this save-only path must never expose it.
+        None,
+        // No see_image tool for the save-only registry.
         None,
     )
     .await;

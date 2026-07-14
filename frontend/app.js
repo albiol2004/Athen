@@ -11670,6 +11670,8 @@ async function renderBundles(bundles, providers) {
             const pick = b.tiers && b.tiers[t];
             if (pick && pick.connection_id) providerIds.add(pick.connection_id);
         }
+        const vpick = b.tiers && b.tiers.vision;
+        if (vpick && vpick.connection_id) providerIds.add(vpick.connection_id);
     }
     await Promise.all(Array.from(providerIds).map((id) => getCuratedModels(id)));
 
@@ -11809,6 +11811,61 @@ function createBundleCard(bundle, providers) {
         // Custom-slug text entry: persist on commit (blur / Enter).
         slugInput.addEventListener('change', () => autoSaveBundle(card, bundle.id));
     }
+
+    // --- Vision model slot (optional) ----------------------------------
+    // Dedicated `Bundle.vision` pick — NOT a tier. Invoked only by explicit
+    // vision calls (describe-and-inject bridge + `see_image`) when the arc's
+    // primary model can't see images. Same row wiring as a tier; data-tier
+    // "vision" is read separately by collectBundleTiers.
+    {
+        const vpick = bundle.tiers.vision || { connection_id: '', slug: '' };
+        const vlabel = document.createElement('label');
+        vlabel.textContent = 'Vision model';
+        vlabel.style.marginTop = '12px';
+        tierRows.appendChild(vlabel);
+        const vhint = document.createElement('div');
+        vhint.className = 'field-hint';
+        vhint.textContent = 'Optional. When the active model can’t see images, this model describes them (and powers the see_image tool). Point at Claude/GPT-5/Gemini vision.';
+        tierRows.appendChild(vhint);
+
+        const row = document.createElement('div');
+        row.className = 'provider-tier-row bundle-tier-row';
+        row.dataset.tier = 'vision';
+        const curated = curatedModelsCache.get(vpick.connection_id) || [];
+        const slugMatched = vpick.slug && curated.some((m) => m.slug === vpick.slug);
+        const customVisible = !slugMatched && (vpick.slug || curated.length === 0);
+        row.innerHTML = `
+            <span class="provider-tier-label" data-tip="Dedicated vision model. Never routed to by tiering — only explicit vision calls.">Vision</span>
+            <select class="bundle-tier-connection">${connectionOptions(vpick.connection_id)}</select>
+            <select class="bundle-tier-model">${buildModelSelectOptions(curated, vpick.slug || '')}</select>
+            <input type="text" class="bundle-tier-slug" value="${escapeHtml(vpick.slug || '')}" placeholder="custom slug (e.g. claude-sonnet-4-6)" style="${customVisible ? '' : 'display: none;'}">
+        `;
+        tierRows.appendChild(row);
+
+        const connSelect = row.querySelector('.bundle-tier-connection');
+        const modelSelect = row.querySelector('.bundle-tier-model');
+        const slugInput = row.querySelector('.bundle-tier-slug');
+
+        connSelect.addEventListener('change', async () => {
+            const carried = (modelSelect.value === BUNDLE_CUSTOM_SLUG_SENTINEL)
+                ? (slugInput.value || '')
+                : (modelSelect.value || '');
+            await rebuildTierModelSelect(row, connSelect.value, carried);
+            autoSaveBundle(card, bundle.id);
+        });
+        modelSelect.addEventListener('change', () => {
+            if (modelSelect.value === BUNDLE_CUSTOM_SLUG_SENTINEL) {
+                slugInput.style.display = '';
+                slugInput.focus();
+                return;
+            }
+            slugInput.value = modelSelect.value;
+            slugInput.style.display = 'none';
+            autoSaveBundle(card, bundle.id);
+        });
+        slugInput.addEventListener('change', () => autoSaveBundle(card, bundle.id));
+    }
+
     body.appendChild(tierRows);
 
     // Actions
@@ -11843,6 +11900,15 @@ function collectBundleTiers(card) {
         const conn = (row.querySelector('.bundle-tier-connection')?.value || '').trim();
         const slug = (row.querySelector('.bundle-tier-slug')?.value || '').trim();
         tiers[t] = (conn && slug) ? { connection_id: conn, slug } : null;
+    }
+    // Vision slot (optional, not a tier). Same "both fields required" rule.
+    const vrow = card.querySelector('.bundle-tier-row[data-tier="vision"]');
+    if (vrow) {
+        const conn = (vrow.querySelector('.bundle-tier-connection')?.value || '').trim();
+        const slug = (vrow.querySelector('.bundle-tier-slug')?.value || '').trim();
+        tiers.vision = (conn && slug) ? { connection_id: conn, slug } : null;
+    } else {
+        tiers.vision = null;
     }
     return tiers;
 }

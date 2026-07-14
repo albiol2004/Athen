@@ -76,6 +76,9 @@ interface BundleTiersView {
   fast?: BundleTierView | null;
   code?: BundleTierView | null;
   powerful?: BundleTierView | null;
+  // Dedicated "Vision model" slot (`Bundle.vision`) — not a tier. Rides
+  // along in the same view so a tier edit preserves it.
+  vision?: BundleTierView | null;
 }
 interface BundleView {
   id: string;
@@ -450,7 +453,23 @@ function BundlesSection({
       fast: b.tiers.fast ?? null,
       code: b.tiers.code ?? null,
       powerful: b.tiers.powerful ?? null,
+      vision: b.tiers.vision ?? null,
       [tier]: value,
+    };
+    await mutate(() =>
+      client.post(`/settings/bundles/${encodeURIComponent(b.id)}`, { tiers }),
+    );
+  };
+
+  // The vision slot is not a `TierKey`, so it needs its own setter that
+  // preserves every tier while replacing `vision`.
+  const setVision = async (b: BundleView, value: BundleTierView | null) => {
+    const tiers: BundleTiersView = {
+      cheap: b.tiers.cheap ?? null,
+      fast: b.tiers.fast ?? null,
+      code: b.tiers.code ?? null,
+      powerful: b.tiers.powerful ?? null,
+      vision: value,
     };
     await mutate(() =>
       client.post(`/settings/bundles/${encodeURIComponent(b.id)}`, { tiers }),
@@ -596,6 +615,69 @@ function BundlesSection({
                 </div>
               );
             })}
+            {(() => {
+              // Vision slot (optional, not a tier). When the active model
+              // can't see, this model describes images + powers see_image.
+              const cur = b.tiers.vision ?? null;
+              const conn = cur?.connection_id ?? '';
+              return (
+                <div className="st-tier-row">
+                  <span
+                    className="st-tier-label"
+                    title="Dedicated vision model. Never routed to by tiering — only explicit vision calls (image describe + see_image) when the active model can't see."
+                  >
+                    Vision
+                  </span>
+                  <select
+                    value={conn}
+                    onChange={(e) => {
+                      const cid = e.target.value;
+                      if (!cid) {
+                        void setVision(b, null);
+                        return;
+                      }
+                      const slug =
+                        cur && cur.connection_id === cid
+                          ? cur.slug
+                          : (providers.find((p) => p.id === cid)?.model ?? '');
+                      void setVision(b, { connection_id: cid, slug });
+                    }}
+                  >
+                    <option value="">— unset —</option>
+                    {providers.map((p) => (
+                      <option key={p.id} value={p.id}>
+                        {p.name}
+                      </option>
+                    ))}
+                  </select>
+                  <input
+                    type="text"
+                    list={conn ? `st-curated-${b.id}-vision` : undefined}
+                    placeholder="model slug"
+                    disabled={!conn}
+                    defaultValue={cur?.slug ?? ''}
+                    key={`${conn}:${cur?.slug ?? ''}`}
+                    onBlur={(e) => {
+                      const slug = e.target.value.trim();
+                      if (!conn || slug === (cur?.slug ?? '')) return;
+                      void setVision(b, { connection_id: conn, slug });
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') (e.target as HTMLInputElement).blur();
+                    }}
+                  />
+                  {conn && (
+                    <datalist id={`st-curated-${b.id}-vision`}>
+                      {(curated[conn] ?? []).map((m) => (
+                        <option key={m.slug} value={m.slug}>
+                          {m.display_name}
+                        </option>
+                      ))}
+                    </datalist>
+                  )}
+                </div>
+              );
+            })()}
           </div>
         ))}
       </div>
