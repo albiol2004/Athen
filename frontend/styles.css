@@ -4319,12 +4319,34 @@ footer {
     max-width: 1040px;
     width: 100%;
     margin: 0 auto;
-    -webkit-mask-image: linear-gradient(to bottom,
-        transparent 0, #000 16px,
-        #000 calc(100% - 20px), transparent 100%);
-    mask-image: linear-gradient(to bottom,
-        transparent 0, #000 16px,
-        #000 calc(100% - 20px), transparent 100%);
+}
+
+/* Top/bottom edge fade on the scrolling settings body. The previous approach
+   used a mask-image, which forces WebKit to composite the whole (tall) scroller
+   through an offscreen buffer on every repaint — a real cost on Settings
+   open/scroll. Instead, two sticky pseudo-strips painted panel-colour →
+   transparent reproduce the fade with a plain gradient paint (no offscreen
+   buffer) on ALL tiers. Negative margins bleed across the 24px padding and
+   collapse the strips' layout footprint so they don't displace content. */
+.settings-content::before,
+.settings-content::after {
+    content: "";
+    display: block;
+    position: sticky;
+    height: 20px;
+    margin: 0 -24px;
+    pointer-events: none;
+    z-index: 2;
+}
+.settings-content::before {
+    top: 0;
+    margin-bottom: -20px;
+    background: linear-gradient(to bottom, var(--surface-1), transparent);
+}
+.settings-content::after {
+    bottom: 0;
+    margin-top: -20px;
+    background: linear-gradient(to top, var(--surface-1), transparent);
 }
 
 .settings-tabs {

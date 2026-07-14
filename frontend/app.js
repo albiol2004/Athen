@@ -4674,9 +4674,38 @@ function renderRenderUnit(unit) {
     }
 }
 
+// Monotonic guard for the chunked transcript renderer. Every renderUnitsChunked
+// call bumps this; a queued idle slice from an older render (e.g. a fast
+// A→B→A arc switch — note B→A returns the SAME arc id, so gating on activeArcId
+// alone would NOT catch it) bails the moment a newer render starts, so two
+// arcs' messages can never interleave.
+let currentRenderToken = 0;
+
+// Shared transcript renderer used by BOTH loadHistory (initial load) and the
+// arc-switch path (via renderEntries): render the first ~2 units eagerly so the
+// user sees content immediately, then stream the rest across idle slices of 2
+// (markdown render dominates cost) to avoid stalling WebKit on long threads.
+function renderUnitsChunked(units) {
+    const myToken = ++currentRenderToken;
+    if (!units || units.length === 0) return;
+    const eagerCount = Math.min(2, units.length);
+    for (let i = 0; i < eagerCount; i++) renderRenderUnit(units[i]);
+    if (units.length > eagerCount) {
+        let idx = eagerCount;
+        const appendChunk = () => {
+            // Bail if a newer render (or arc switch) superseded this one.
+            if (myToken !== currentRenderToken) return;
+            const end = Math.min(idx + 2, units.length);
+            for (; idx < end; idx++) renderRenderUnit(units[idx]);
+            if (idx < units.length) scheduleIdle(appendChunk);
+        };
+        scheduleIdle(appendChunk);
+    }
+}
+
 function renderEntries(entries) {
     if (!entries) return;
-    for (const unit of buildRenderUnits(entries)) renderRenderUnit(unit);
+    renderUnitsChunked(buildRenderUnits(entries));
 }
 
 // Render a collapsed group of tool_call entries: a clickable strip showing
@@ -6754,23 +6783,10 @@ async function loadHistory() {
             const welcome = messagesEl.querySelector('.welcome-message');
             if (welcome) welcome.remove();
 
-            // Group tool_calls into their dropdowns up-front, then stream
-            // the units across idle slices to avoid stalling WebKit on long
-            // conversations.
-            const units = buildRenderUnits(entries);
-            const eagerCount = Math.min(2, units.length);
-            for (let i = 0; i < eagerCount; i++) renderRenderUnit(units[i]);
-
-            if (units.length > eagerCount) {
-                let idx = eagerCount;
-                const appendChunk = () => {
-                    // Two units per slice — markdown render dominates cost.
-                    const end = Math.min(idx + 2, units.length);
-                    for (; idx < end; idx++) renderRenderUnit(units[idx]);
-                    if (idx < units.length) scheduleIdle(appendChunk);
-                };
-                scheduleIdle(appendChunk);
-            }
+            // Group tool_calls into their dropdowns up-front, then stream the
+            // units across idle slices (shared with the arc-switch path) to
+            // avoid stalling WebKit on long conversations.
+            renderUnitsChunked(buildRenderUnits(entries));
         }
     } catch (err) {
         console.error('Failed to load history:', err);
@@ -9154,19 +9170,26 @@ async function loadSettings() {
             }
         }
 
-        await loadMcpCatalog();
-        await loadMcpServers();
-        await loadToolboxPackages();
-        await loadGrants();
-        await loadProfileManager();
-        await loadIdentityManager();
-        await loadSkillsManager();
-        await loadProjectsManager();
-        await loadCloudApis();
+        // These panel loaders are mutually independent — each targets its own
+        // DOM subtree + globals and carries its own try/catch — so run them
+        // concurrently instead of serially (total time ≈ slowest loader, not
+        // the sum). allSettled so one loader's rejection can't sink the rest.
+        // loadVoicePanel() stays fire-and-forget (not awaited), as before.
         loadVoicePanel();
-        await loadAttachmentPolicySettings();
-        await loadOwnerContact();
-        await loadGithubIdentities();
+        await Promise.allSettled([
+            loadMcpCatalog(),
+            loadMcpServers(),
+            loadToolboxPackages(),
+            loadGrants(),
+            loadProfileManager(),
+            loadIdentityManager(),
+            loadSkillsManager(),
+            loadProjectsManager(),
+            loadCloudApis(),
+            loadAttachmentPolicySettings(),
+            loadOwnerContact(),
+            loadGithubIdentities(),
+        ]);
 
         // Let opt-in listeners (e.g. the email setup wizard's connected-pill
         // + advanced-auto-open logic) react after every settings field is in
