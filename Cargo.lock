@@ -305,7 +305,6 @@ dependencies = [
  "tar",
  "tempfile",
  "tokio",
- "tokio-stream",
  "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
@@ -318,7 +317,6 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "athen-core",
- "athen-ipc",
  "athen-risk",
  "athen-sandbox",
  "athen-shell",
@@ -346,7 +344,7 @@ dependencies = [
 
 [[package]]
 name = "athen-app"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -356,7 +354,6 @@ dependencies = [
  "athen-contacts",
  "athen-coordinador",
  "athen-core",
- "athen-ipc",
  "athen-llm",
  "athen-mcp",
  "athen-memory",
@@ -416,8 +413,6 @@ dependencies = [
  "chrono-tz",
  "quick-xml 0.36.2",
  "reqwest 0.12.28",
- "serde",
- "thiserror 2.0.18",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -436,7 +431,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 2.0.18",
  "tokio",
  "tracing",
 ]
@@ -447,19 +441,15 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "athen-agent",
- "athen-contacts",
  "athen-coordinador",
  "athen-core",
  "athen-llm",
  "athen-persistence",
  "athen-risk",
- "athen-sentidos",
- "athen-shell",
  "athen-vault",
  "chrono",
  "serde_json",
  "tokio",
- "tracing",
  "tracing-subscriber",
  "uuid",
 ]
@@ -471,10 +461,8 @@ dependencies = [
  "async-trait",
  "athen-core",
  "chrono",
- "serde",
  "serde_json",
  "tokio",
- "tracing",
  "uuid",
 ]
 
@@ -485,11 +473,9 @@ dependencies = [
  "async-trait",
  "athen-contacts",
  "athen-core",
- "athen-ipc",
  "athen-risk",
  "athen-sentidos",
  "chrono",
- "serde",
  "serde_json",
  "tokio",
  "tracing",
@@ -521,7 +507,6 @@ dependencies = [
  "async-trait",
  "athen-core",
  "chrono",
- "serde",
  "serde_json",
  "tempfile",
  "tokio",
@@ -543,7 +528,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
- "tokio-stream",
  "tracing",
  "uuid",
 ]
@@ -555,7 +539,6 @@ dependencies = [
  "async-trait",
  "athen-core",
  "rmcp",
- "serde",
  "serde_json",
  "tokio",
  "tracing",
@@ -570,7 +553,6 @@ dependencies = [
  "athen-llm",
  "chrono",
  "rusqlite",
- "serde",
  "serde_json",
  "tempfile",
  "tokio",
@@ -618,8 +600,6 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "athen-core",
- "serde",
- "serde_json",
  "tempfile",
  "tokio",
  "tracing",
@@ -650,7 +630,6 @@ dependencies = [
  "async-trait",
  "athen-contacts",
  "athen-core",
- "athen-ipc",
  "chrono",
  "imap",
  "lettre",
@@ -674,8 +653,6 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "athen-core",
- "serde",
- "serde_json",
  "tokio",
  "tracing",
 ]
@@ -701,7 +678,6 @@ name = "athen-voice"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "athen-core",
  "chrono",
  "serde",
  "serde_json",
