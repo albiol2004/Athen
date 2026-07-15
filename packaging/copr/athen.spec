@@ -1,5 +1,5 @@
 Name:           athen
-Version:        0.6.0
+Version:        0.6.1
 Release:        1%{?dist}
 Summary:        Universal proactive AI agent (Tauri 2 desktop app)
 
@@ -94,6 +94,11 @@ rm %{buildroot}/Athen.desktop
 %{_datadir}/icons/hicolor/*/apps/athen-app.png
 
 %changelog
+* Wed Jul 15 2026 Alejandro Garcia <contact@alejandrogarcia.blog> - 0.6.1-1
+- Fix Copr build timeout: revert release profile LTO from "fat" back to "thin"
+  (fat LTO pushed the build past Copr's 5h wall on all chroots; thin built
+  v0.5.x in ~58min).
+
 * Tue Jul 14 2026 Alejandro Garcia <contact@alejandrogarcia.blog> - 0.6.0-1
 - Release 0.6.0
 

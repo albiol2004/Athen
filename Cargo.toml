@@ -87,7 +87,10 @@ quick-xml = "0.36"
 
 [profile.release]
 strip = true          # drop symbols/debuginfo from the shipped binary
-lto = "fat"           # whole-program LTO: better cross-crate inlining + dead-code elim than "thin"; release-only build-time cost
+lto = "thin"          # thin LTO: nearly all of fat's cross-crate benefit at a fraction of the build time.
+                      # DO NOT set "fat": it blew the Copr release build past its 5h timeout on this
+                      # workspace (v0.6.0, all chroots), where "thin" built v0.5.x in ~58min. Only
+                      # revisit "fat" if you've verified Copr can finish it (raise --timeout first).
 codegen-units = 1     # single CGU maximizes optimization/dedup across the crate
 # opt-level left at default 3 — "s" is a size-vs-speed DECISION for the human (see loop/REPORT.md)
 # panic = "abort" intentionally NOT set: workspace code relies on unwinding
