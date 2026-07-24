@@ -1294,10 +1294,7 @@ fn map_openai_reasoning(family: ModelFamily, effort: ReasoningEffort) -> Option<
     // Kimi K2.6 / K2.7 take no effort knob: K2.7's thinking is forced on,
     // K2.6 defaults to on, and the open platform only accepts its
     // non-standard `thinking` field, which we don't need to send.
-    if matches!(
-        family,
-        ModelFamily::KimiK26Cloud | ModelFamily::KimiK27Code
-    ) {
+    if matches!(family, ModelFamily::KimiK26Cloud | ModelFamily::KimiK27Code) {
         return None;
     }
     // Kimi K3 speaks a top-level OpenAI-style `reasoning_effort` field
