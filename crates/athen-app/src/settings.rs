@@ -606,8 +606,11 @@ pub(crate) fn default_base_url(id: &str) -> &str {
         // `/v1/chat/completions`.
         "kimi" => "https://api.moonshot.ai",
         // Kimi Code Plan subscription relay. Anthropic-compat wire — the
-        // adapter appends `/v1/messages`, yielding the documented
-        // `api.kimi.com/coding/v1/messages`.
+        // adapter appends `/v1/messages`, yielding the working
+        // `api.kimi.com/coding/v1/messages`. Empirically verified
+        // 2026-07-24: the `/coding/v1` base form from vendor docs is for
+        // clients that append `/messages` themselves; with our adapter it
+        // would double the prefix and 404 as `/v1/v1/messages`.
         "kimi_code" => "https://api.kimi.com/coding",
         // xAI (Grok) — OpenAI-compatible API. Adapter appends
         // `/v1/chat/completions` (via the OpenAiCompatibleProvider fallback).
@@ -639,10 +642,11 @@ pub(crate) fn default_model(id: &str) -> &str {
         // MiniMax Token Plan: M3 is the newest flagship (2026-06); Starter
         // tier exposes only this model, higher tiers add the full lineup.
         "minimax" | "minimax_anthropic" => "minimax-m3",
-        // Kimi K2.7 Code is the June 2026 coding flagship (256K ctx,
-        // forced thinking) — the right default for an agent loop.
-        "kimi" => "kimi-k2.7-code",
-        // Code Plan keys only route the plan slug.
+        // Kimi K3 is the July 2026 flagship (1M ctx, native vision,
+        // thinking always-on) — the right default for an agent loop.
+        "kimi" => "kimi-k3",
+        // Code Plan default stays `kimi-for-coding` — available to all
+        // plan members (`k3` / `k3-256k` are gated to higher plan tiers).
         "kimi_code" => "kimi-for-coding",
         // xAI Grok 4.5 flagship (OpenAI-compat wire).
         "xai" => "grok-4.5",
@@ -709,10 +713,14 @@ fn default_family(id: &str) -> &str {
         // MiniMax M3 (2026-06) — the newest flagship profile. User can switch
         // in the family dropdown if pointing at an older M2.x slug.
         "minimax" | "minimax_anthropic" => "MiniMaxM3Cloud",
-        // Both Kimi entries default to the K2.7 Code profile (forced
-        // thinking, reasoning echo). Other platform slugs (kimi-k2.6,
-        // kimi-k2-thinking) resolve per-slug via the quirks registry.
-        "kimi" | "kimi_code" => "KimiK27Code",
+        // `kimi` tracks the new `kimi-k3` default model so the "+ Add
+        // Provider" autofill yields a consistent model+family pair;
+        // `kimi_code` stays on the K2.7 Code profile (`kimi-for-coding`
+        // is K2.7 Code under the hood). This is only a connection-level
+        // fallback — other platform slugs (kimi-k2.6, kimi-k2-thinking)
+        // resolve per-slug via the quirks registry.
+        "kimi" => "KimiK3Cloud",
+        "kimi_code" => "KimiK27Code",
         // xAI Grok 4.5 (same wire shape as Grok 4).
         "xai" => "Grok45",
         _ => "Default",
@@ -793,9 +801,9 @@ fn default_tier_slugs(id: &str) -> (&'static str, &'static str, &'static str, &'
         // xAI serves one Grok flagship — every tier maps to it; users edit
         // per-tier if xAI ships a cheaper mini SKU.
         "xai" => ("grok-4.5", "grok-4.5", "grok-4.5", "grok-4.5"),
-        // Moonshot platform: K2.6 covers the cheap/fast tiers; K2.7 Code
-        // is the coding/agentic flagship for Code + Powerful.
-        "kimi" => ("kimi-k2.6", "kimi-k2.6", "kimi-k2.7-code", "kimi-k2.7-code"),
+        // Moonshot platform: K2.6 covers the cheap/fast tiers; K3 is the
+        // flagship for Code + Powerful.
+        "kimi" => ("kimi-k2.6", "kimi-k2.6", "kimi-k3", "kimi-k3"),
         // Code Plan exposes exactly one plan-routed slug.
         "kimi_code" => (
             "kimi-for-coding",
@@ -886,12 +894,22 @@ pub(crate) fn curated_models(id: &str) -> &'static [(&'static str, &'static str)
         ],
         "xai" => &[("grok-4.5", "Grok 4.5"), ("grok-4", "Grok 4 (legacy)")],
         "kimi" => &[
+            ("kimi-k3", "Kimi K3"),
             ("kimi-k2.7-code", "Kimi K2.7 Code"),
+            ("kimi-k2.7-code-highspeed", "Kimi K2.7 Code Highspeed"),
             ("kimi-k2.6", "Kimi K2.6"),
             ("kimi-k2-thinking", "Kimi K2 Thinking"),
             ("kimi-k2-turbo-preview", "Kimi K2 Turbo"),
         ],
-        "kimi_code" => &[("kimi-for-coding", "Kimi for Coding (plan-routed)")],
+        // Only catalog slugs are offered: `kimi-k2.7-code` / `kimi-k2.6`
+        // return 200 on this endpoint via silent aliasing but are NOT
+        // real Code Plan catalog entries.
+        "kimi_code" => &[
+            ("kimi-for-coding", "Kimi K2.7 Code (plan-routed)"),
+            ("kimi-for-coding-highspeed", "Kimi K2.7 Code Highspeed"),
+            ("k3", "Kimi K3"),
+            ("k3-256k", "Kimi K3 (256k)"),
+        ],
         // Local providers: user picks whatever they pulled. The text input
         // remains the only path.
         _ => &[],
@@ -967,7 +985,7 @@ fn cost_note(id: &str) -> &'static str {
         "openrouter" => "Aggregator — prices vary by model. Some models are free.",
         "opencode_go" => "Relay service with own pricing — check their dashboard.",
         "minimax" | "minimax_anthropic" => "Token plan — check MiniMax pricing page.",
-        "kimi" => "Pay-as-you-go — K2.7 Code pricing on the Moonshot platform page.",
+        "kimi" => "Pay-as-you-go — see the Moonshot platform pricing page.",
         "kimi_code" => "Kimi Code Plan subscription — usage included up to plan quota.",
         "xai" => "Pay-as-you-go — check the xAI pricing page for Grok rates.",
         "ollama" | "llamacpp" => "Free — runs on your hardware.",
@@ -2066,7 +2084,12 @@ pub(crate) async fn test_provider_core(
     let result = match id.as_str() {
         "ollama" => test_ollama(&client, &url).await,
         "llamacpp" => test_llamacpp(&client, &url).await,
-        "anthropic" => test_anthropic(&client, &url, &key, &model).await,
+        // kimi_code speaks the Anthropic wire (`/v1/messages` + `x-api-key`,
+        // verified against api.kimi.com/coding). Its OpenAI-compat surface
+        // hard-rejects temperature != 1 ("invalid temperature: only 1 is
+        // allowed for this model"), so routing it through
+        // test_openai_compatible fails spuriously.
+        "anthropic" | "kimi_code" => test_anthropic(&client, &url, &key, &model).await,
         "google" => test_google(&client, &url, &key, &model).await,
         _ => test_openai_compatible(&client, &url, &key, &model).await,
     };

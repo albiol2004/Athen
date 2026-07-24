@@ -117,10 +117,11 @@ pub const PRESETS: &[ProviderPreset] = &[
     ProviderPreset {
         id: "kimi",
         label: "Kimi (Moonshot platform)",
-        default_slug: "kimi-k2.7-code",
-        // Source: ModelFamily::KimiK27Code wire_id in athen-core/src/llm.rs
-        family: "KimiK27Code",
-        context_window_tokens: 262_144,
+        default_slug: "kimi-k3",
+        // Source: ModelFamily::KimiK3Cloud wire_id in athen-core/src/llm.rs
+        family: "KimiK3Cloud",
+        // K3 flagship: 1M ctx (262_144 was the K2.7-era window).
+        context_window_tokens: 1_048_576,
         key_page_url: "https://platform.moonshot.ai/console/api-keys",
         custom: false,
     },

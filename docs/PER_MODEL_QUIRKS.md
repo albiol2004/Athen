@@ -259,6 +259,8 @@ Last verified: **2026-05-19** (code audit: quirks/mod.rs reasoning_content fallb
 | `Qwen3CoderNext` | Qwen3-Coder Next | `Qwen/Qwen3-Coder-Next` | InlineXmlQwenStyle [a] | InlineThinkTags | SystemMustBeFirst | — | — |
 | `Gemma4Local` | Gemma 4 (local) | `gemma-4-27b-it` | Structured [b] | InlineThinkTags | SystemMustBeFirst | UnescapeDoubleEncodedJsonArrays | system_message_required |
 | `KimiK26Cloud` | Kimi K2.6 cloud | `kimi-k2-6` | Structured | SeparateField | Lenient | — | — |
+| `KimiK27Code` | Kimi K2.7 Code cloud | `kimi-k2.7-code` | Structured | SeparateField | Lenient | — | echo_reasoning_on_tool_turn [e] |
+| `KimiK3Cloud` | Kimi K3 cloud | `kimi-k3` | Structured | SeparateField | Lenient | — | echo_reasoning_on_tool_turn [e] |
 | `MiniMaxM25Cloud` | MiniMax M2.5 cloud | `minimax-m2-5` | InlineXmlVendorTagged("minimax") | InlineThinkTags | Lenient | — | — |
 | `Llama32Instruct` | Llama 3.2 (Vision / 70B class) | `llama-3.2-90b-vision-instruct` | InlineJsonLlama | None | Lenient | — | — |
 | `Llama33Instruct` | Llama 3.3 70B instruct | `meta-llama/Llama-3.3-70B-Instruct` | InlineJsonLlama | None | Lenient | — | — |
@@ -294,6 +296,12 @@ Notes:
   **Verify `reasoning_content` / `<think>` handling and tool-call extraction
   against the live GLM-5.2 and MiniMax-M3 APIs before relying on them.** Both
   carry matching `BEST-EFFORT` comments in `quirks/seed.rs`.
+- **[e]** Kimi K2.7 Code and K3 force thinking server-side (K3 cannot disable
+  it); reasoning surfaces as a separate `reasoning_content` field and
+  Preserved Thinking requires echoing the prior turn's reasoning back on
+  tool turns. Sampling params (temperature/top_p) are pinned server-side for
+  all Kimi models on the OpenAI-compat wire — the adapter omits them (the
+  Code Plan relay hard-rejects `temperature != 1`).
 
 The `Default` row is the safety net: any provider whose user hasn't
 picked a family falls through to it and reproduces today's OpenAI-compat
@@ -398,6 +406,9 @@ this is fine.
 |---|---|---|---|
 | Kimi K2.6 cloud | `kimi-k2-6` | `KimiK26Cloud` | `reasoning_content` field; preserve-thinking |
 | Kimi K2 Thinking | `kimi-k2-thinking` | `KimiK26Cloud` | Explicit thinking mode |
+| Kimi K2.7 Code | `kimi-k2.7-code` (`-highspeed` variant) | `KimiK27Code` | Forced thinking; `reasoning_content` echo on tool turns; 256K ctx |
+| Kimi K3 (open platform) | `kimi-k3` | `KimiK3Cloud` | Flagship (2026-07-16); 1M ctx; native vision; thinking always-on; sampling pinned server-side |
+| Kimi K3 (Code Plan) | `k3`, `k3-256k` | `KimiK3Cloud` | Code Plan catalog slugs; `k3` gated to higher plan tiers |
 | MiniMax M3 | `minimax-m3` | `MiniMaxM3Cloud` | **BEST-EFFORT** [d]; 428B MoE, multimodal; OpenAI + Anthropic wires; `<think>` interleave echoed every turn |
 | MiniMax M2.7 | `minimax-m2.7` | `MiniMaxM27Cloud` | Bracket-delimited tool calls |
 | MiniMax M2.5 | `minimax-m2-5` | `MiniMaxM25Cloud` | `<minimax:tool_call>` namespaced XML when not via vLLM |

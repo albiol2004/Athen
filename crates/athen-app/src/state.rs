@@ -7467,7 +7467,7 @@ fn default_model_for(id: &str) -> &str {
         "google" => "gemini-3.1-flash-lite-preview",
         "opencode_go" => "deepseek-v4-flash",
         "minimax" | "minimax_anthropic" => "minimax-m3",
-        "kimi" => "kimi-k2.7-code",
+        "kimi" => "kimi-k3",
         "kimi_code" => "kimi-for-coding",
         "xai" => "grok-4.5",
         "ollama" => "llama3",

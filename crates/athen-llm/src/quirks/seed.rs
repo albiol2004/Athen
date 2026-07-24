@@ -36,6 +36,11 @@ pub fn default_slug_for_family(family: ModelFamily) -> &'static str {
         ModelFamily::Gemma4Local => "gemma-4-27b-it",
         ModelFamily::KimiK26Cloud => "kimi-k2-6",
         ModelFamily::KimiK27Code => "kimi-k2.7-code",
+        // Open-platform slug; the Kimi Code Plan relay serves `k3` /
+        // `k3-256k`, handled by the per-slug registry below (same split
+        // as K2.7, whose family default is `kimi-k2.7-code` while
+        // kimi_code uses `kimi-for-coding`).
+        ModelFamily::KimiK3Cloud => "kimi-k3",
         ModelFamily::MiniMaxM25Cloud => "minimax-m2-5",
         ModelFamily::MiniMaxM27Cloud => "minimax-m2.7",
         ModelFamily::Llama32Instruct => "llama-3.2-90b-vision-instruct",
@@ -173,6 +178,17 @@ pub fn quirks_for_family(family: ModelFamily) -> ModelQuirks {
             ..ModelQuirks::default()
         },
 
+        // Kimi K3 cloud: thinking always-on (cannot be disabled), surfaces
+        // as a separate `reasoning_content` field; Preserved Thinking
+        // requires the prior turn's reasoning to ride back on tool turns.
+        // Sampling params are pinned server-side (temperature/top_p must
+        // be omitted — handled in the OpenAI body builder).
+        ModelFamily::KimiK3Cloud => ModelQuirks {
+            reasoning_surface: ReasoningSurface::SeparateField,
+            echo_reasoning_on_tool_turn: true,
+            ..ModelQuirks::default()
+        },
+
         // MiniMax M2.5 cloud: vendor-tagged inline XML, inline think tags.
         ModelFamily::MiniMaxM25Cloud => ModelQuirks {
             tool_extraction: ToolExtractionStrategy::InlineXmlVendorTagged("minimax"),
@@ -300,6 +316,7 @@ pub fn family_supports_vision(family: ModelFamily) -> Option<bool> {
         ModelFamily::Gemini3Pro | ModelFamily::Gemini3Flash => Some(true), // Gemini 3.x multimodal.
         ModelFamily::MiniMaxM3Cloud => Some(true),               // MiniMax M3 accepts image input.
         ModelFamily::Grok4 | ModelFamily::Grok45 => Some(true),  // Grok 4.x is multimodal.
+        ModelFamily::KimiK3Cloud => Some(true), // K3 is natively multimodal per the vendor model card.
         // The Llama 3.2 / Llama 4 families are heterogeneous — they span
         // vision checkpoints (3.2 90B-Vision, Llama 4 Scout/Maverick) AND
         // text-only ones (3.2 1B/3B). A curated verdict here would override
@@ -421,11 +438,14 @@ const BUILTIN_SLUG_QUIRKS: &[(&str, &str, ModelFamily)] = &[
     // the `grok-4*` prefix (first-match-wins).
     ("xai", "grok-4.5*", ModelFamily::Grok45),
     ("xai", "grok-4*", ModelFamily::Grok4),
-    // Kimi (Moonshot platform): K2.7 Code before the K2* wildcard
+    // Kimi (Moonshot platform): K3, then K2.7 Code before the K2* wildcard
     // (first-match-wins).
+    ("kimi", "kimi-k3*", ModelFamily::KimiK3Cloud),
     ("kimi", "kimi-k2.7*", ModelFamily::KimiK27Code),
     ("kimi", "kimi-k2*", ModelFamily::KimiK26Cloud),
-    // Kimi Code Plan relay: one plan-routed slug, K2.7 Code under the hood.
+    // Kimi Code Plan relay: `k3` / `k3-256k` resolve to K3; the plan-routed
+    // `kimi-for-coding*` slugs stay K2.7 Code under the hood.
+    ("kimi_code", "k3*", ModelFamily::KimiK3Cloud),
     ("kimi_code", "kimi-for-coding*", ModelFamily::KimiK27Code),
     // --- OpenCode Go relay (per-slug wire dispatch) ------------------------
     // The provider adapter is selected by `is_minimax_slug` in
@@ -570,6 +590,7 @@ mod tests {
             family_supports_vision(ModelFamily::KimiK27Code),
             Some(false)
         );
+        assert_eq!(family_supports_vision(ModelFamily::KimiK3Cloud), Some(true));
         assert_eq!(
             family_supports_vision(ModelFamily::Qwen35Local),
             Some(false)
@@ -677,6 +698,34 @@ mod tests {
         assert_eq!(q.reasoning_surface, ReasoningSurface::SeparateField);
         assert!(q.echo_reasoning_on_tool_turn);
         assert_eq!(q.tool_extraction, ToolExtractionStrategy::Structured);
+    }
+
+    #[test]
+    fn kimi_k3_echoes_reasoning_on_tool_turns() {
+        // Thinking always-on + Preserved Thinking: separate reasoning
+        // field that must round-trip on tool turns, structured tool calls.
+        let q = quirks_for_family(ModelFamily::KimiK3Cloud);
+        assert_eq!(q.reasoning_surface, ReasoningSurface::SeparateField);
+        assert!(q.echo_reasoning_on_tool_turn);
+        assert_eq!(q.tool_extraction, ToolExtractionStrategy::Structured);
+    }
+
+    #[test]
+    fn slug_lookup_kimi_k3_before_k2_rows() {
+        // Direct Moonshot platform connection: K3 resolves to its own
+        // family, K2-shaped slugs are unaffected.
+        let q = lookup_slug_quirks("kimi", "kimi-k3").unwrap();
+        assert_eq!(q.family, ModelFamily::KimiK3Cloud);
+        let q = lookup_slug_quirks("kimi", "kimi-k2.6").unwrap();
+        assert_eq!(q.family, ModelFamily::KimiK26Cloud);
+        // Code Plan relay: `k3` prefix covers both served K3 slugs.
+        let q = lookup_slug_quirks("kimi_code", "k3").unwrap();
+        assert_eq!(q.family, ModelFamily::KimiK3Cloud);
+        let q = lookup_slug_quirks("kimi_code", "k3-256k").unwrap();
+        assert_eq!(q.family, ModelFamily::KimiK3Cloud);
+        // K2.7 plan slug still resolves to K2.7 Code.
+        let q = lookup_slug_quirks("kimi_code", "kimi-for-coding").unwrap();
+        assert_eq!(q.family, ModelFamily::KimiK27Code);
     }
 
     #[test]

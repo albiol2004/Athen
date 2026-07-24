@@ -290,11 +290,25 @@ impl OpenAiCompatibleProvider {
                 .collect()
         });
 
+        // Kimi K2.6 / K2.7 / K3 pin sampling server-side: any temperature
+        // other than exactly 1 is rejected with HTTP 400 ("invalid
+        // temperature: only 1 is allowed for this model"). Omitting the
+        // field lets the server default apply (verified against the live
+        // coding endpoint 2026-07-24).
+        let temperature = if matches!(
+            self.family,
+            ModelFamily::KimiK26Cloud | ModelFamily::KimiK27Code | ModelFamily::KimiK3Cloud
+        ) {
+            None
+        } else {
+            Some(request.temperature.unwrap_or(0.7))
+        };
+
         OpenAiRequestOut {
             model: self.default_model.clone(),
             messages,
             max_tokens: request.max_tokens.unwrap_or(4096),
-            temperature: request.temperature.unwrap_or(0.7),
+            temperature,
             tools,
             stream: false,
             stream_options: None,
@@ -1238,6 +1252,9 @@ impl CostEstimator for OpenAiCostEstimator {
 ///   Llama 3.x / 4 families have no reasoning support — silently
 ///   dropped to keep the request body identical to today's.
 /// - **Ollama**: `{ "think": bool }` at the top level.
+/// - **Kimi (Moonshot)**: K3 takes a top-level `reasoning_effort`
+///   (`low|high|max`) — NOT the OpenAI `reasoning` object. K2.6 / K2.7
+///   take no knob: K2.7's thinking is forced on, K2.6 defaults to on.
 ///
 /// Default → omit the field entirely (provider built-in default
 /// applies). Off → either `"none"` (OpenAI gpt-5.x) or
@@ -1274,6 +1291,28 @@ pub(crate) fn map_reasoning_effort(
 }
 
 fn map_openai_reasoning(family: ModelFamily, effort: ReasoningEffort) -> Option<serde_json::Value> {
+    // Kimi K2.6 / K2.7 take no effort knob: K2.7's thinking is forced on,
+    // K2.6 defaults to on, and the open platform only accepts its
+    // non-standard `thinking` field, which we don't need to send.
+    if matches!(
+        family,
+        ModelFamily::KimiK26Cloud | ModelFamily::KimiK27Code
+    ) {
+        return None;
+    }
+    // Kimi K3 speaks a top-level OpenAI-style `reasoning_effort` field
+    // (low|high|max), NOT the `{"reasoning":{"effort":...}}` object.
+    // Thinking is always-on server-side, so Off maps to omission just
+    // like Default (the provider default effort applies).
+    if matches!(family, ModelFamily::KimiK3Cloud) {
+        let level = match effort {
+            ReasoningEffort::Default | ReasoningEffort::Off => return None,
+            ReasoningEffort::Minimal | ReasoningEffort::Low => "low",
+            ReasoningEffort::Medium | ReasoningEffort::High => "high",
+            ReasoningEffort::Max => "max",
+        };
+        return Some(serde_json::json!({ "reasoning_effort": level }));
+    }
     // o4-mini family lacks `none` and `xhigh` — clamp at the edges.
     let is_o4_mini = matches!(family, ModelFamily::OpenAiO3);
     // gpt-5.4-mini ceiling is `high` (no `xhigh`). The dedicated mini
@@ -1356,7 +1395,10 @@ struct OpenAiRequestOut {
     model: String,
     messages: Vec<OpenAiMessageOut>,
     max_tokens: u32,
-    temperature: f32,
+    /// Omitted for the Kimi K2.6/K2.7/K3 families — their servers pin
+    /// sampling and 400 on any value other than exactly 1.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<OpenAiTool>>,
     stream: bool,
@@ -1561,7 +1603,7 @@ mod tests {
 
         assert_eq!(body.model, "gpt-4o");
         assert_eq!(body.max_tokens, 1024);
-        assert_eq!(body.temperature, 0.5);
+        assert_eq!(body.temperature, Some(0.5));
         assert!(!body.stream);
         assert!(body.tools.is_none());
         assert_eq!(body.messages.len(), 1);
@@ -1628,7 +1670,33 @@ mod tests {
         let body = provider.build_request_body(&request);
 
         assert_eq!(body.max_tokens, 4096);
-        assert_eq!(body.temperature, 0.7);
+        assert_eq!(body.temperature, Some(0.7));
+    }
+
+    #[test]
+    fn kimi_families_omit_temperature_from_wire_body() {
+        // Kimi K2.6/K2.7/K3 400 on any temperature other than exactly 1 —
+        // the field must not appear in the serialized body at all.
+        for family in [
+            ModelFamily::KimiK26Cloud,
+            ModelFamily::KimiK27Code,
+            ModelFamily::KimiK3Cloud,
+        ] {
+            let provider = make_provider().with_family(family);
+            let request = simple_request(); // carries temperature: Some(0.5)
+            let body = provider.build_request_body(&request);
+            assert_eq!(body.temperature, None, "{family:?}");
+            let wire = serde_json::to_value(&body).expect("serializes");
+            assert!(
+                wire.get("temperature").is_none(),
+                "{family:?} must omit temperature: {wire}"
+            );
+        }
+        // Non-Kimi families keep sending temperature on the wire.
+        let provider = make_provider();
+        let wire = serde_json::to_value(provider.build_request_body(&simple_request()))
+            .expect("serializes");
+        assert_eq!(wire["temperature"], 0.5);
     }
 
     #[test]
@@ -2276,6 +2344,52 @@ data: [DONE]
         assert_eq!(body["reasoning"]["effort"], "low");
         let body = body_with("openai", ModelFamily::OpenAiO3, ReasoningEffort::Max);
         assert_eq!(body["reasoning"]["effort"], "high");
+    }
+
+    #[test]
+    fn kimi_k3_uses_top_level_reasoning_effort() {
+        // K3 takes `reasoning_effort` (low|high|max) at the top level —
+        // never the OpenAI `reasoning` object.
+        let body = body_with("kimi", ModelFamily::KimiK3Cloud, ReasoningEffort::Low);
+        assert_eq!(body["reasoning_effort"], "low");
+        assert!(body.get("reasoning").is_none(), "{body}");
+        let body = body_with("kimi", ModelFamily::KimiK3Cloud, ReasoningEffort::Minimal);
+        assert_eq!(body["reasoning_effort"], "low");
+        let body = body_with("kimi", ModelFamily::KimiK3Cloud, ReasoningEffort::Medium);
+        assert_eq!(body["reasoning_effort"], "high");
+        let body = body_with("kimi", ModelFamily::KimiK3Cloud, ReasoningEffort::High);
+        assert_eq!(body["reasoning_effort"], "high");
+        let body = body_with("kimi", ModelFamily::KimiK3Cloud, ReasoningEffort::Max);
+        assert_eq!(body["reasoning_effort"], "max");
+        // Default and Off omit the field (thinking is always-on server-side).
+        for eff in [ReasoningEffort::Default, ReasoningEffort::Off] {
+            let body = body_with("kimi", ModelFamily::KimiK3Cloud, eff);
+            assert!(
+                body.get("reasoning_effort").is_none() && body.get("reasoning").is_none(),
+                "K3 must omit effort for {eff:?}: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn kimi_k26_and_k27_send_no_reasoning_effort() {
+        // K2.7 thinking is forced on; K2.6 defaults to on. Neither accepts
+        // the OpenAI `reasoning` object, so any configured override is
+        // dropped rather than sent in the wrong shape.
+        for family in [ModelFamily::KimiK26Cloud, ModelFamily::KimiK27Code] {
+            for eff in [
+                ReasoningEffort::Default,
+                ReasoningEffort::Off,
+                ReasoningEffort::Low,
+                ReasoningEffort::Max,
+            ] {
+                let body = body_with("kimi", family, eff);
+                assert!(
+                    body.get("reasoning").is_none() && body.get("reasoning_effort").is_none(),
+                    "{family:?} must not send effort for {eff:?}: {body}"
+                );
+            }
+        }
     }
 
     #[test]

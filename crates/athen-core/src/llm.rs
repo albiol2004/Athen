@@ -272,6 +272,12 @@ pub enum ModelFamily {
     /// thinking (`reasoning_content` separate field) that must be echoed
     /// back on tool turns (`preserve_thinking`).
     KimiK27Code,
+    /// Kimi K3 (Moonshot, July 2026). Flagship MoE, 1M ctx, native vision,
+    /// forced thinking surfacing as `reasoning_content` with
+    /// Preserved-Thinking echo on tool turns; `reasoning_effort`
+    /// low/high/max; sampling params pinned server-side (omit
+    /// temperature/top_p).
+    KimiK3Cloud,
     MiniMaxM25Cloud,
     MiniMaxM27Cloud,
     Llama32Instruct,
@@ -333,6 +339,7 @@ impl ModelFamily {
             ModelFamily::Gemma4Local => "Gemma 4 (local)",
             ModelFamily::KimiK26Cloud => "Kimi K2.6 cloud",
             ModelFamily::KimiK27Code => "Kimi K2.7 Code cloud",
+            ModelFamily::KimiK3Cloud => "Kimi K3 cloud",
             ModelFamily::MiniMaxM25Cloud => "MiniMax M2.5 cloud",
             ModelFamily::MiniMaxM27Cloud => "MiniMax M2.7 cloud",
             ModelFamily::Llama32Instruct => "Llama 3.2 instruct (Vision / 70B class)",
@@ -371,6 +378,7 @@ impl ModelFamily {
             ModelFamily::Gemma4Local => "Gemma4Local",
             ModelFamily::KimiK26Cloud => "KimiK26Cloud",
             ModelFamily::KimiK27Code => "KimiK27Code",
+            ModelFamily::KimiK3Cloud => "KimiK3Cloud",
             ModelFamily::MiniMaxM25Cloud => "MiniMaxM25Cloud",
             ModelFamily::MiniMaxM27Cloud => "MiniMaxM27Cloud",
             ModelFamily::Llama32Instruct => "Llama32Instruct",
@@ -414,6 +422,7 @@ impl ModelFamily {
             ModelFamily::Gemma4Local,
             ModelFamily::KimiK26Cloud,
             ModelFamily::KimiK27Code,
+            ModelFamily::KimiK3Cloud,
             ModelFamily::MiniMaxM25Cloud,
             ModelFamily::MiniMaxM27Cloud,
             ModelFamily::Llama32Instruct,
